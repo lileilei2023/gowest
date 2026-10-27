@@ -3,10 +3,10 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.8.2-6366f1">
+  <img alt="version" src="https://img.shields.io/badge/version-0.9.0-6366f1">
   <img alt="platform" src="https://img.shields.io/badge/server-Ubuntu%2024.04%20amd64%20%7C%20arm64-e95420">
   <img alt="sing-box" src="https://img.shields.io/badge/sing--box-1.14.3-0ea5e9">
-  <img alt="tests" src="https://img.shields.io/badge/tests-274%20passed-22c55e">
+  <img alt="tests" src="https://img.shields.io/badge/tests-299%20passed-22c55e">
   <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-blue">
   <img alt="clients" src="https://img.shields.io/badge/clients-macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-64748b">
 </p>
@@ -23,17 +23,25 @@
 
 ---
 
-**gowest** 适合**几个人合租一台海外服务器**：在空白的 Ubuntu 24.04 上，用一条命令部署 **Hysteria2 + VLESS REALITY** 双协议代理，每人一个订阅链接，带宽公平分配，按月控制流量，四端订阅都已配好 AI / Claude 分流。一个人用也完全可以。
+**gowest** 适合**几个人合租一台海外服务器**：在空白的 Ubuntu 24.04 上，用一条命令部署 **Hysteria2（端口跳跃）+ VLESS REALITY + TUIC + AnyTLS** 四协议代理，每人一个订阅链接，带宽公平分配，按月控制流量，四端订阅都已配好 AI / Claude 分流。一个人用也完全可以。
 
 - **一个本地网页搞定**：在自己电脑上打开管理页面，点几下完成安装、导入和日常配置；也可以用一条命令；失败自动回滚。
-- **双线路互备**：Hy2 优先，故障时自动切到 VLESS，不会悄悄走直连。
+- **晚高峰更稳**：Hy2 端口跳跃绕开运营商对单个 UDP 端口的限速；同机四种协议（Hy2、VLESS REALITY、TUIC、AnyTLS）自动回退，任何时候都不会悄悄走直连。
+- **线路体检**：点一下就能看到你和服务器之间走的是 CN2 GIA、9929 还是普通线路，以及延迟、丢包和下载速度。
 - **多人共用**：每人一个订阅链接；忙时均分，闲时拉满；随时加人、删人、换链接，其他人不受影响。
 - **按人管流量**：每个链接可以单独设速度上限、月流量额度和到期日，超了只停那一个人。
 - **解锁检测**：点一下就能看这台服务器能不能用 Claude、ChatGPT、TikTok、YouTube。
 
 ## 🚀 快速开始
 
-**1. 准备服务器**：一台空白的 Ubuntu 24.04，能用 SSH 密钥登录。在云控制台的安全组放行 **TCP/UDP 443** 和 **TCP 80**；多人共用时改为放行 **TCP/UDP 20001-20032** 和 **TCP 80**，以后加人就不用再改安全组。
+**1. 准备服务器**：一台空白的 Ubuntu 24.04，能用 SSH 密钥登录。在云控制台的安全组放行：
+
+| | 需要放行 |
+| --- | --- |
+| 一个人用 | TCP/UDP 443、TCP/UDP 2443、UDP 24576-24639、TCP 80 |
+| 多人共用 | TCP/UDP 20001-27000、TCP 80（一次开好，以后加人不用再改） |
+
+安装时如果关掉"稳定性增强"（端口跳跃和备用协议），只需要 TCP/UDP 443（多人 20001-20032）和 TCP 80。
 
 **2. 在你自己的电脑上打开管理页面**：
 
@@ -81,6 +89,8 @@ Windows 上没有 `sh`：用网页，或者 SSH 登录服务器后在服务器�
 | 每人速度上限、流量额度、到期日 | 每行的编辑按钮 | `users set` |
 | 整台服务器的带宽、月流量、计量方式 | 首页卡片右上角的编辑按钮 | `bandwidth`、`traffic` |
 | 检查端口、解锁检测 | 右上角按钮 | `check`、`unlock` |
+| 线路体检 | 右上角"线路体检" | `linecheck` |
+| 端口跳跃、备用协议、Hy2 混淆 | "线路与协议"卡片里的开关 | `options --hopping on --protocols tuic,anytls` |
 | 升级 | 右上角"升级"（有新版本时会提示） | `upgrade` |
 | 卸载（可恢复） | 右上角"⋯"→ 卸载，需输入 IP 确认 | `rollback` |
 
@@ -138,6 +148,17 @@ Windows 上没有 `sh`：用网页，或者 SSH 登录服务器后在服务器�
 - 每人的用量按他自己的上传加下载统计，订阅里显示的是他自己的用量和额度。整台服务器的用量另外统计，大约是所有人用量之和的两倍，因为服务器收发各算一次，云厂商一般按这个计费。
 - 额度和到期日用 `0` 或 `none` 取消。超额的人下个月自动恢复；调高额度后几分钟内恢复。
 - 只写数字时，流量按 GB、带宽按 Mbps 计算。实现原理见 [详细说明](docs/详细说明.md)。
+
+## 🛡 稳定性与防泄漏
+
+<p align="center"><img src="docs/images/webui-line.png" alt="线路与协议、线路体检" width="100%"></p>
+
+- **四种协议、两个端口**：每个订阅链接在主端口上提供 VLESS REALITY（TCP）和 Hysteria2（UDP），在第二个端口上提供 AnyTLS（TCP）和 TUIC（UDP）。客户端的"自动回退"按 Hy2 → VLESS → TUIC → AnyTLS 的顺序选第一个可用的。
+- **端口跳跃**：Hy2 每 30 秒换一个 UDP 端口（每人 64 个端口一组），运营商针对单个端口的晚高峰限速就失效了。跳跃的流量照样计入这个人的用量，也照样参与带宽均分。
+- **绝不直连**：自动回退组和 AI、Claude、YouTube、TikTok 组里都没有 DIRECT。所有节点都不可用时，请求会被拒绝，不会悄悄改走你自己的网络。DIRECT 只出现在最顶层的"出口选择"里，由你自己手动选择。
+- **证书固定**：Hy2、TUIC、AnyTLS 都固定了服务器证书的指纹，证书被替换就拒绝连接，不存在"跳过校验"带来的中间人风险。小火箭不支持固定 TUIC 和 AnyTLS 的证书，所以小火箭只使用 Hy2 和 VLESS。
+- **DNS 不泄漏**：除国内域名外，DNS 查询都通过代理走加密 DoH。
+- **服务器端只动自己的东西**：端口跳跃的转发规则和按人统计都放在 gowest 自己的 nftables 表里，不改 UFW 或你自己的规则，卸载时一起删除。
 
 ## 🧭 Claude / TikTok 能不能用
 

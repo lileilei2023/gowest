@@ -99,7 +99,10 @@ def main():
         if s.get('users'):
             import accounting
             import render
-            ports = dict(zip(s['users'], render.proxy_ports(s)))
+            s = render.settings(s)
+            layout = render.port_layout(s)
+            ports = {name: [x['main']] + ([x['alt']] if s['extra_protocols'] else [])
+                     for name, x in layout.items()}
             try:
                 record = accounting.sync(s, ports)
             except (OSError, RuntimeError) as error:

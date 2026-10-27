@@ -24,7 +24,8 @@ MANAGEMENT = {'plan', 'install', 'status', 'verify', 'urls', 'rollback', 'repair
 
 def build_settings(server_ip, up, down, mode, host='', cert='', key='', tailnet='',
                    accept_http_risk=False, subscription_port=None, node_prefix='LA', http_port=80,
-                   users=(), quota='', metering='both', on_exceed='warn', user_caps=None):
+                   users=(), quota='', metering='both', on_exceed='warn', user_caps=None,
+                   extra_protocols=('tuic', 'anytls'), port_hopping=True, hy2_obfs=True):
     ip = ipaddress.IPv4Address(server_ip)
     if not ip.is_global:
         raise ValueError('请填写新服务器的真实公网 IPv4，不要使用示例/内网地址。')
@@ -48,6 +49,8 @@ def build_settings(server_ip, up, down, mode, host='', cert='', key='', tailnet=
                             'node_prefix': node_prefix, 'ipv6': True, 'tailnet': tailnet,
                             'hosts': {}, 'subscription': subscription, 'users': list(users),
                             'user_caps': dict(user_caps or {}),
+                            'extra_protocols': list(extra_protocols), 'port_hopping': port_hopping,
+                            'hy2_obfs': hy2_obfs,
                             'traffic': {'total_bytes': render.parse_bytes(quota), 'expire_epoch': 0,
                                         'metering': metering, 'on_exceed': on_exceed}})
 
@@ -159,6 +162,7 @@ def wizard():
         on_exceed = 'warn'
         if render.parse_bytes(quota):
             on_exceed = prompt('超出后：warn = 只提醒，stop = 暂停代理到下月', 'warn')
+        stable = prompt('端口跳跃 + 备用协议 TUIC/AnyTLS，晚高峰更稳（回车 = 开启，输入 n = 关闭）', 'y').lower() != 'n'
         print('所有方式都生成电脑、Android、小火箭配置，无需逐端选择。')
         print('1 = HTTPS（需域名证书）；2 = HTTP（明文风险）；3 或 1,2 = 同时提供 HTTPS 和 HTTP。')
         choice = prompt('订阅方式（默认 HTTP）', '2')
@@ -174,7 +178,8 @@ def wizard():
         tailnet = prompt('可选：自己的 xxx.ts.net 域名，留空跳过')
         config = build_settings(address, up, down, mode, host, cert, key, tailnet, accepted,
                                 node_prefix=prefix, users=users, quota=quota, on_exceed=on_exceed,
-                                user_caps=caps)
+                                user_caps=caps, extra_protocols=render.EXTRA_PROTOCOLS if stable else (),
+                                port_hopping=stable)
         save_settings(config, output)
     subprocess.run(kit_runtime.command(['plan', '--settings', str(output)]), check=True)
     if platform.system() != 'Linux' or os.geteuid() != 0:
@@ -183,13 +188,17 @@ def wizard():
         print('sudo ' + entry + ' install --settings <参数文件路径> --confirm-new-server ' + config['server_ip'])
         return
     print('安装会检查本机防火墙并尝试安全新增 UFW 规则；不清空规则、不改变 SSH、不自动启停防火墙。')
-    ports = '、'.join(str(p) for p in render.proxy_ports(config))
-    print('云安全组需要云平台授权；当前无法自动验证，必须检查 TCP/UDP ' + ports + ' 和所选订阅端口。')
+    print('云安全组需要云平台授权；当前无法自动验证，必须放行：' + '、'.join(render.cloud_ports(config)) + '。')
     confirmation = prompt('当前目标公网 IPv4 为 ' + config['server_ip'] + '；输入 INSTALL 开始安装，留空取消')
     if confirmation != 'INSTALL':
         print('未确认安装，服务器配置未改变。')
         return
     dispatch(['install', '--settings', str(output), '--confirm-new-server', config['server_ip']])
+
+
+def protocol_list(text):
+    value = (text or '').strip().lower()
+    return [] if value in ('', 'none') else [x.strip() for x in value.split(',')]
 
 
 def quick_install(a):
@@ -203,13 +212,15 @@ def quick_install(a):
     print(f'公网 IPv4：{address}（{detected["source"]}）；带宽 {down} Mbps；'
           + (f'{len(names)} 个订阅链接' if names else '1 份') + '；订阅走 HTTP（明文，勿在不可信网络里更新订阅）。')
     config = build_settings(address, up, down, 'http', accept_http_risk=True, node_prefix=a.node_prefix,
-                            users=names, quota=a.monthly_quota, on_exceed=a.on_exceed, user_caps=caps)
+                            users=names, quota=a.monthly_quota, on_exceed=a.on_exceed, user_caps=caps,
+                            extra_protocols=protocol_list(a.protocols), port_hopping=not a.no_port_hopping,
+                            hy2_obfs=not a.no_obfs)
     output = ROOT / 'settings.local.json'
     if output.exists() or output.is_symlink():
         output = ROOT / time.strftime('settings-%Y%m%d-%H%M%S.json')
     save_settings(config, output)
-    ports = '、'.join(str(p) for p in render.proxy_ports(config))
-    print(f'云安全组请放行 TCP/UDP {ports} 和 TCP 80' + ('（多人时建议直接放行 20001-20032，以后加人不用再改）' if names else '') + '。')
+    print('云安全组请放行：' + '、'.join(render.cloud_ports(config))
+          + ('（多人时建议直接放行 TCP/UDP 20001-27000，以后加人不用再改）' if names else '') + '。')
     dispatch(['install', '--settings', str(output), '--confirm-new-server', address])
 
 
@@ -273,6 +284,9 @@ def main(argv=None):
                       help='云套餐计量方式：both = 进+出（默认，偏保守）；outbound = 只计出方向')
     init.add_argument('--on-exceed', choices=('warn', 'stop'), default='warn',
                       help='超出上限：warn 只提醒；stop 暂停代理直到下月或上限调高')
+    init.add_argument('--no-port-hopping', action='store_true')
+    init.add_argument('--protocols', default='tuic,anytls', help='备用协议：tuic,anytls 中任选；none = 只用 Hy2 + VLESS')
+    init.add_argument('--no-obfs', action='store_true')
     init.add_argument('--output', default='settings.local.json')
     quick = commands.add_parser('quick', help='零问答安装：自动识别 IP，HTTP 订阅，其余用默认值；以后都能再改')
     quick.add_argument('bandwidth', help='套餐带宽，如 100、100Mbps、1Gbps')
@@ -280,6 +294,9 @@ def main(argv=None):
     quick.add_argument('--monthly-quota', default='', help='整台服务器每月流量上限，如 1TB；默认不设置')
     quick.add_argument('--on-exceed', choices=('warn', 'stop'), default='warn')
     quick.add_argument('--node-prefix', default='LA')
+    quick.add_argument('--no-port-hopping', action='store_true', help='不开端口跳跃（安全组只能开少量端口时）')
+    quick.add_argument('--protocols', default='tuic,anytls', help='备用协议：tuic,anytls 中任选；none = 只用 Hy2 + VLESS')
+    quick.add_argument('--no-obfs', action='store_true', help='Hy2 不加 salamander 混淆')
     commands.add_parser('firewall', help='离线生成/校验防火墙模板；详见 firewall --help')
     offline = commands.add_parser('render', help='离线生成全部客户端配置；不安装、不发布链接')
     offline.add_argument('--settings', required=True)
@@ -303,7 +320,8 @@ def main(argv=None):
     config = build_settings(address, up, down, mode,
                             a.subscription_host, a.certificate, a.private_key, a.tailnet,
                             a.accept_http_risk, a.subscription_port, a.node_prefix, a.http_port,
-                            names, a.monthly_quota, a.metering, a.on_exceed, caps)
+                            names, a.monthly_quota, a.metering, a.on_exceed, caps,
+                            protocol_list(a.protocols), not a.no_port_hopping, not a.no_obfs)
     save_settings(config, a.output)
 
 

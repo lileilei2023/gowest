@@ -268,6 +268,26 @@ def api_rollback(server, body):
     return {'output': ANSI.sub('', out)}
 
 
+def api_options(server, body):
+    args = ['options']
+    for key in ('hopping', 'obfs'):
+        if key in body:
+            args += ['--' + key, 'on' if body[key] else 'off']
+    if 'protocols' in body:
+        chosen = [p for p in ('tuic', 'anytls') if p in (body['protocols'] or [])]
+        args += ['--protocols', ','.join(chosen) or 'none']
+    if len(args) == 1:
+        raise UserError('没有要修改的选项')
+    out = remote(server['target'], installed_command(args + ['--confirm-server', server['ip']]), timeout=180)
+    return {'output': ANSI.sub('', out)}
+
+
+def api_linecheck(server):
+    sys.path.insert(0, str(KIT))
+    import linecheck
+    return linecheck.check(remote_json(server['target'], ['endpoints']))
+
+
 def api_check(server):
     sys.path.insert(0, str(KIT))
     import localcheck
@@ -286,6 +306,8 @@ def api_install(server, body):
     if clean(body, 'quota'):
         args += ['--monthly-quota', clean(body, 'quota'), '--on-exceed',
                  body.get('on_exceed') if body.get('on_exceed') in ('warn', 'stop') else 'warn']
+    if body.get('stable') in (False, 'off', 'false', ''):
+        args += ['--no-port-hopping', '--protocols', 'none']
     if clean(body, 'prefix', re.compile(r'[A-Za-z][A-Za-z0-9-]{0,24}')):
         args += ['--node-prefix', clean(body, 'prefix')]
     command = f'cd {REMOTE_DIR} && sudo -n bash deploy.sh ' + ' '.join(shlex.quote(a) for a in args)
@@ -401,6 +423,8 @@ class Handler(BaseHTTPRequestHandler):
                       'bandwidth': lambda: api_bandwidth(server, body),
                       'traffic': lambda: api_traffic(server, body),
                       'rollback': lambda: api_rollback(server, body),
+                      'options': lambda: api_options(server, body),
+                      'linecheck': lambda: api_linecheck(server),
                       'install': lambda: {'job': api_install(server, body).id},
                       'upgrade': lambda: {'job': api_upgrade(server).id}}
             if action in simple:
@@ -439,7 +463,10 @@ def demo(method, parts, body):
                 'subscription_scheme': 'http', 'fair_share': parts[1] == 'la', 'fair_share_result': 'applied',
                 'warnings': [], 'single': parts[1] != 'la', 'users': rows if parts[1] == 'la' else [],
                 'traffic': {'month': '2026-10', 'used_bytes': int(873.6 * GB), 'quota_bytes': 2000 * GB,
-                            'metering': 'both', 'on_exceed': 'stop', 'paused_month': None}}
+                            'metering': 'both', 'on_exceed': 'stop', 'paused_month': None},
+                'options': {'port_hopping': True, 'extra_protocols': ['tuic', 'anytls'], 'hy2_obfs': True},
+                'cloud_ports': (['TCP/UDP 20001-20004', 'TCP/UDP 21001-21004', 'UDP 24576-24831', 'TCP 80']
+                                if parts[1] == 'la' else ['TCP/UDP 443', 'TCP/UDP 2443', 'UDP 24576-24639', 'TCP 80'])}
     if parts[2:] == ['urls']:
         base = 'http://203.0.113.7/sub/3f9c2d7e1b4a6058c9e2f1d0a7b3c4e5d6f7a8b9c0d1e2f3'
         return {'base': base, 'files': {'normal.yaml': base, 'strict.yaml': base + '-us', 'nodes.txt': base + '-nodes',
@@ -459,6 +486,12 @@ def demo(method, parts, body):
                            {'name': 'ChatGPT', 'level': 'warn', 'text': '网页可用，App 会提示 VPN（IP 被识别为代理）'},
                            {'name': 'TikTok', 'level': 'ok', 'text': '可用，识别地区 US'},
                            {'name': 'YouTube', 'level': 'ok', 'text': '可用，地区 US'}]}
+    if parts[2:] == ['linecheck']:
+        return {'route': {'key': 'CN2 GIA', 'label': '电信 CN2 GIA', 'verdict': '优质线路：晚高峰也比较稳', 'hops': 14,
+                          'path': ['192.168.1.1', '100.64.0.1', '61.152.24.1', '202.101.63.1', '59.43.246.1',
+                                   '59.43.182.1', '59.43.130.1', '203.0.113.1', '203.0.113.7']},
+                'latency': {'avg': 156.2, 'min': 152.8, 'max': 171.4, 'jitter': 4.1, 'loss': 0.0},
+                'speed': {'mbps': 186.4, 'megabytes': 16.0}, 'peak': True}
     if parts[2:] in (['install'], ['upgrade']):
         return {'job': 'demo'}
     return {'ok': True}

@@ -20,13 +20,18 @@ def check(directory, sing_box=None, mihomo=None, geodata=None):
     src = Path(directory).resolve()
     server = json.loads((src / 'server.json').read_text())
     users = json.loads((src / 'users.json').read_text()) if (src / 'users.json').is_file() else ['']
+    settings = render.settings(json.loads((src / 'settings.json').read_text()))
     fair = server['inbounds'][1]['ignore_client_bandwidth']
-    assert len(server['inbounds']) == 2 * len(users), 'Expected one VLESS + Hy2 pair per user'
-    assert len({i['listen_port'] for i in server['inbounds']}) == len(users), 'Each user needs its own port'
+    extra = settings['extra_protocols']
+    assert len(server['inbounds']) == (2 + len(extra)) * len(users), 'Unexpected inbound count per user'
+    ports_per_user = 2 if extra else 1
+    assert len({i['listen_port'] for i in server['inbounds']}) == ports_per_user * len(users), \
+        'Each user needs its own ports'
+    layout = render.port_layout(settings)
     folders = []
     for index, name in enumerate(users):
         folder = src / render.account_dir(name)
-        check_account(src, folder, server, index, name, fair)
+        check_account(src, folder, server, index, name, fair, settings, layout[name])
         folders.append(folder)
     tokens = [(f / 'subscription-urls.txt').read_text().split('/sub/')[1].split()[0] for f in folders]
     assert len(set(tokens)) == len(tokens), 'Subscription tokens must be unique per user'
@@ -62,7 +67,7 @@ def check(directory, sing_box=None, mihomo=None, geodata=None):
             'mihomo': 'passed' if mihomo else 'not run', 'network_changes': False}
 
 
-def check_account(src, folder, server, index, name, fair):
+def check_account(src, folder, server, index, name, fair, settings, ports):
     normal = yaml.safe_load((folder / 'normal.yaml').read_text())
     strict = yaml.safe_load((folder / 'strict.yaml').read_text())
     hy = next(p for p in normal['proxies'] if p['type'] == 'hysteria2')
@@ -73,10 +78,32 @@ def check_account(src, folder, server, index, name, fair):
     hin = next(i for i in server['inbounds'] if i['tag'] == 'hy2-in' + suffix)
     assert len(vin['users']) == len(hin['users']) == 1, 'One credential per inbound pair'
     assert hy['password'] == hin['users'][0]['password']
-    assert hy['obfs-password'] == hin['obfs']['password']
+    if settings['hy2_obfs']:
+        assert hy['obfs-password'] == hin['obfs']['password']
     assert vl['uuid'] == vin['users'][0]['uuid']
     assert hin['users'][0].get('name', '') == name
-    assert hy['port'] == vl['port'] == hin['listen_port'] == vin['listen_port'], 'Client port must match its inbound'
+    assert hy['port'] == vl['port'] == hin['listen_port'] == vin['listen_port'] == ports['main'], \
+        'Client port must match its inbound'
+    if settings['port_hopping']:
+        assert hy['ports'] == '{}-{}'.format(*ports['hop']) and hy['hop-interval'] > 0, 'Hy2 hop range mismatch'
+    else:
+        assert 'ports' not in hy, 'Port hopping configured but not enabled'
+    assert ('obfs' in hin) == settings['hy2_obfs'] == ('obfs' in hy), 'Hy2 obfuscation must match on both sides'
+    nodes = [hy['name'], vl['name']]
+    for proto, kind in (('tuic', 'tuic'), ('anytls', 'anytls')):
+        inbound = next((i for i in server['inbounds'] if i['tag'] == proto + '-in' + suffix), None)
+        client = next((p for p in normal['proxies'] if p['type'] == kind), None)
+        if proto not in settings['extra_protocols']:
+            assert inbound is None and client is None, proto + ' present but not enabled'
+            continue
+        assert inbound and client, proto + ' enabled but missing'
+        assert client['port'] == inbound['listen_port'] == ports['alt'], proto + ' port mismatch'
+        assert client['password'] == inbound['users'][0]['password']
+        if kind == 'tuic':
+            assert client['uuid'] == inbound['users'][0]['uuid']
+        # Pinning is what makes skip-cert-verify safe; it must never be missing.
+        assert client['fingerprint'] == hy['fingerprint'], proto + ' certificate is not pinned'
+        nodes.append(client['name'])
     if fair:
         # Shared server: no client Brutal targets, the server commands BBR.
         assert 'up' not in hy and 'down' not in hy, 'Fair-share clients must not carry Brutal bandwidth'
@@ -87,11 +114,13 @@ def check_account(src, folder, server, index, name, fair):
     uris = base64.b64decode((folder / 'nodes.txt').read_text().strip(), validate=True).decode().splitlines()
     assert len(uris) == 2, 'Expected exactly two native node URIs'
     hy_uri, vl_uri = map(urlsplit, uris)
+    assert ('obfs-password' in hy_uri.query) == settings['hy2_obfs']
     assert hy_uri.scheme == 'hysteria2' and vl_uri.scheme == 'vless'
     assert hy_uri.hostname == hy['server'] and vl_uri.hostname == vl['server']
     assert hy_uri.port == vl_uri.port == hy['port'], 'Native URI port must match the profile'
     assert unquote(hy_uri.username) == hy['password'] and vl_uri.username == vl['uuid']
-    assert parse_qs(hy_uri.query)['obfs-password'] == [hy['obfs-password']]
+    if settings['hy2_obfs']:
+        assert parse_qs(hy_uri.query)['obfs-password'] == [hy['obfs-password']]
     assert parse_qs(hy_uri.query)['pinSHA256'] == [hy['fingerprint']]
     assert parse_qs(vl_uri.query)['pbk'] == [vl['reality-opts']['public-key']]
     assert parse_qs(vl_uri.query)['sid'] == [vl['reality-opts']['short-id']]
@@ -102,12 +131,22 @@ def check_account(src, folder, server, index, name, fair):
         assert client['tun']['enable'] is False, 'Renderer must not enable TUN'
         for group in client['proxy-groups']:
             if group['type'] == 'fallback':
-                assert group['proxies'] == [hy['name'], vl['name']]
+                assert group['proxies'] == nodes, 'Failover must list exactly this server\'s nodes'
                 assert 'DIRECT' not in group['proxies']
+            elif group['name'] != render.SELECT_GROUP:
+                assert 'DIRECT' not in group['proxies'], 'Only the top selector may offer DIRECT'
         assert not any(k.startswith('external-controller') or k == 'secret' for k in client)
     assert not any(x in strict['rules'] for x in ['GEOSITE,cn,DIRECT', 'GEOIP,CN,DIRECT'])
     for name, cfg in [('shadowrocket.conf', normal), ('shadowrocket-us.conf', strict)]:
-        render.validate_shadowrocket_config((folder / name).read_text(), cfg)
+        render.validate_shadowrocket_config((folder / name).read_text(), pinned_only(cfg))
+
+
+def pinned_only(cfg):
+    """The Shadowrocket projection carries only Hy2 + VLESS (it cannot pin the others)."""
+    dropped = {p['name'] for p in cfg['proxies'] if p['type'] in ('tuic', 'anytls')}
+    return dict(cfg, proxies=[p for p in cfg['proxies'] if p['name'] not in dropped],
+                **{'proxy-groups': [dict(g, proxies=[x for x in g['proxies'] if x not in dropped])
+                                    for g in cfg['proxy-groups']]})
 
 
 if __name__ == '__main__':

@@ -25,19 +25,31 @@ def nft(*args, data=None, check=True):
     return p
 
 
+def port_group(value):
+    """A URL's ports: its main port first, then the extra protocols' port."""
+    return [value] if isinstance(value, int) else list(value)
+
+
 def ruleset(ports, blocked=()):
-    """ports: {name: port}. A blocked port is dropped before it is counted."""
+    """ports: {name: port or [main, alt]}; counters are named after the main port.
+
+    Hopped Hy2 traffic is counted under the main port: the redirect has already
+    happened at prerouting, before this input hook, and replies leave from the
+    main port before the kernel restores the hopped one. A paused URL's ports
+    are dropped before they are counted."""
+    groups = sorted(((name, port_group(p)) for name, p in ports.items()), key=lambda x: x[1][0])
+    match = lambda group: str(group[0]) if len(group) == 1 else '{ ' + ', '.join(map(str, group)) + ' }'
     lines = [f'table inet {TABLE} {{']
-    for port in sorted(ports.values()):
-        lines += [f'    counter p{port}_in {{ }}', f'    counter p{port}_out {{ }}']
+    for _, group in groups:
+        lines += [f'    counter p{group[0]}_in {{ }}', f'    counter p{group[0]}_out {{ }}']
     lines.append('    chain input {\n        type filter hook input priority -150; policy accept;')
-    for name, port in sorted(ports.items(), key=lambda x: x[1]):
+    for name, group in groups:
         if name in blocked:
-            lines.append(f'        meta l4proto {{ tcp, udp }} th dport {port} drop')
-        lines.append(f'        meta l4proto {{ tcp, udp }} th dport {port} counter name "p{port}_in"')
+            lines.append(f'        meta l4proto {{ tcp, udp }} th dport {match(group)} drop')
+        lines.append(f'        meta l4proto {{ tcp, udp }} th dport {match(group)} counter name "p{group[0]}_in"')
     lines.append('    }\n    chain output {\n        type filter hook output priority -150; policy accept;')
-    for port in sorted(ports.values()):
-        lines.append(f'        meta l4proto {{ tcp, udp }} th sport {port} counter name "p{port}_out"')
+    for _, group in groups:
+        lines.append(f'        meta l4proto {{ tcp, udp }} th sport {match(group)} counter name "p{group[0]}_out"')
     lines.append('    }\n}')
     return '\n'.join(lines) + '\n'
 
@@ -107,7 +119,8 @@ def sync(s, ports, path=None, now=None, live=None, apply=None):
     old = json.loads(path.read_text()) if path.is_file() else {}
     fresh = old.get('month') != month
     users = {}
-    for name, port in ports.items():
+    for name, value in ports.items():
+        port = port_group(value)[0]
         prev = old.get('users', {}).get(name, {})
         last = prev.get('last', [0, 0]) if prev.get('port') == port else [0, 0]
         current = live.get(port, [0, 0])

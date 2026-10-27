@@ -23,6 +23,8 @@ const PATHS = {
   server: '<rect x="4" y="4" width="16" height="7" rx="1.6"/><rect x="4" y="13" width="16" height="7" rx="1.6"/><path d="M8 7.5h.01M8 16.5h.01"/>',
   phone: '<rect x="7" y="2.5" width="10" height="19" rx="2.4"/><path d="M11 18.5h2"/>',
   laptop: '<rect x="4" y="5" width="16" height="11" rx="1.6"/><path d="M2 19h20"/>',
+  route: '<circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M8 19h8a3.5 3.5 0 0 0 0-7H8a3.5 3.5 0 0 1 0-7h8"/>',
+  layers: '<path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/>',
   android: '<path d="M5 17a7 7 0 0 1 14 0z"/><path d="M8 10.5 6.5 8M16 10.5 17.5 8"/><path d="M9.5 14h.01M14.5 14h.01"/>',
 };
 const icon = (name, size = 16) =>
@@ -194,7 +196,7 @@ function serverHead(server, st) {
         ${newer ? `<span class="chip warn">可升级到 ${esc(S.version)}</span>` : ''}</div>
     </div>
     <div class="actions">
-      ${installed ? btn('check', 'radar', '检查连通') + btn('unlock', 'sparkle', '解锁检测') + btn('upgrade', 'upgrade', '升级', newer) : ''}
+      ${installed ? btn('check', 'radar', '检查连通') + btn('linecheck', 'route', '线路体检') + btn('unlock', 'sparkle', '解锁检测') + btn('upgrade', 'upgrade', '升级', newer) : ''}
       <button class="btn icon" data-act="refresh" title="刷新">${icon('refresh')}</button>
       <div class="menu-wrap"><button class="btn icon" data-act="menu" data-menu="server" title="更多">${icon('more')}</button>
         ${S.menu === 'server' ? `<div class="menu">
@@ -235,8 +237,10 @@ function installView(server) {
       <div class="field"><label>每月流量上限</label><input name="quota" placeholder="如 1TB；留空 = 不设置"></div>
       <div class="field"><label>超出上限后</label><select name="on_exceed"><option value="warn">只提醒</option><option value="stop">暂停代理到下个月</option></select></div>
       <div class="field"><label>节点标签</label><input name="prefix" value="LA" placeholder="LA"><div class="hint">区分多台服务器的节点名，如 LA、DC</div></div>
+      <div class="field"><label>稳定性增强</label><select name="stable"><option value="on">开启：端口跳跃 + 备用协议 TUIC / AnyTLS（推荐）</option><option value="off">关闭：只用 Hy2 + VLESS，需要开的端口最少</option></select>
+        <div class="hint">晚高峰运营商限速单个 UDP 端口时，端口跳跃能明显改善；以后可以随时开关</div></div>
     </form>
-    <div class="banner" style="margin:10px 22px 0">${icon('alert')}<span>开始前请在云控制台的安全组放行 TCP/UDP 443（多人共用放行 20001-20032）和 TCP 80。订阅使用 HTTP，会明文传输订阅地址。</span></div>
+    <div class="banner" style="margin:10px 22px 0">${icon('alert')}<span>开始前请在云控制台的安全组放行：<b>一个人用</b> TCP/UDP 443、2443，UDP 24576-24639；<b>多人共用</b> TCP/UDP 20001-27000；以及订阅用的 TCP 80。关闭稳定性增强时只需 TCP/UDP 443（多人 20001-20032）和 TCP 80。订阅使用 HTTP，会明文传输订阅地址。</span></div>
     <div class="modal-foot"><button class="btn primary" data-act="install">${icon('server')}开始安装</button></div>
   </div>`;
 }
@@ -268,7 +272,7 @@ function dashboard(server, st) {
   </div>`;
   const warnings = st.warnings.length
     ? `<div class="banner">${icon('alert')}<span>${st.warnings.map(esc).join('<br>')}</span></div>` : '';
-  return `<div class="stack">${stats}${warnings}${usersCard(st)}${resultsCards(server)}</div>`;
+  return `<div class="stack">${stats}${warnings}${usersCard(st)}${optionsCard(st)}${resultsCards(server)}</div>`;
 }
 
 function usersCard(st) {
@@ -304,6 +308,26 @@ function usersCard(st) {
     <tbody>${rows}</tbody></table></div>`;
 }
 
+const OPTIONS = [
+  ['hopping', 'Hy2 端口跳跃', '每 30 秒换一个 UDP 端口，绕开运营商对单个端口的限速；需要安全组放行一段 UDP 端口'],
+  ['tuic', 'TUIC（备用，UDP）', '另一种 UDP 协议，Hy2 被针对时的退路'],
+  ['anytls', 'AnyTLS（备用，TCP）', '另一种 TCP 协议，VLESS 被针对时的退路'],
+  ['obfs', 'Hy2 混淆（salamander）', '把 Hy2 流量打乱成随机字节；关闭后看起来像普通 HTTP/3'],
+];
+
+function optionsCard(st) {
+  const o = st.options || {};
+  const on = { hopping: o.port_hopping, tuic: (o.extra_protocols || []).includes('tuic'),
+    anytls: (o.extra_protocols || []).includes('anytls'), obfs: o.hy2_obfs };
+  const rows = OPTIONS.map(([key, title, text]) => `<div class="opt">
+      <div><b>${esc(title)}</b><small>${esc(text)}</small></div>
+      <button class="switch ${on[key] ? 'on' : ''}" data-act="toggle" data-key="${key}" role="switch" aria-checked="${!!on[key]}"><i></i></button>
+    </div>`).join('');
+  return `<div class="card"><div class="card-head"><h2>线路与协议</h2><span class="sub">客户端更新订阅后生效 · 失败自动恢复</span></div>
+    <div class="opts">${rows}</div>
+    <div class="ports"><span class="muted">云安全组需要放行</span>${(st.cloud_ports || []).map((p) => `<span class="chip mono">${esc(p)}</span>`).join('')}</div></div>`;
+}
+
 function resultsCards(server) {
   const r = S.results[server.id] || {};
   const MARK = { true: ['ok', '✓'], false: ['fail', '✗'], null: ['na', '·'], ok: ['ok', '✓'], warn: ['warn', '!'], fail: ['fail', '✗'] };
@@ -311,6 +335,17 @@ function resultsCards(server) {
   let html = '';
   if (r.check) html += `<div class="card"><div class="card-head"><h2>连通性检查</h2><span class="sub">从这台电脑访问服务器，看到的就是客户端看到的</span></div>
     <div class="results">${r.check.map((x) => row(String(x.ok), x.name, x.text)).join('')}</div></div>`;
+  if (r.line) {
+    const l = r.line, lat = l.latency, sp = l.speed;
+    const level = { 'CN2 GIA': 'ok', '9929': 'ok', 'CMI': 'ok', 'CN2 GT': 'warn' }[l.route.key] || (l.route.key ? 'warn' : 'na');
+    html += `<div class="card"><div class="card-head"><h2>线路体检</h2><span class="sub">从这台电脑直连服务器，不经过任何代理${l.peak ? ' · 晚高峰实测' : ' · 建议晚上 8–11 点再测一次'}</span></div>
+      <div class="results">
+        ${row(level, '线路', l.route.label + ' —— ' + l.route.verdict)}
+        ${'avg' in lat ? row(lat.loss > 5 ? 'fail' : lat.loss > 0 || lat.jitter > 30 ? 'warn' : 'ok', '延迟', `平均 ${lat.avg} ms（${lat.min}–${lat.max}），抖动 ${lat.jitter} ms，丢包 ${lat.loss}%`) : row('fail', '延迟', '全部超时，代理端口连不上')}
+        ${sp ? ('mbps' in sp ? row(sp.mbps >= 50 ? 'ok' : sp.mbps >= 10 ? 'warn' : 'fail', '下载', `${sp.mbps} Mbps（单连接，${sp.megabytes} MB）`) : row('fail', '下载', '失败：' + sp.error)) : ''}
+      </div>
+      ${l.route.path.length ? `<div class="hops">${l.route.path.map((h) => `<span class="chip mono">${esc(h)}</span>`).join('<span class="muted">›</span>')}</div>` : ''}</div>`;
+  }
   if (r.unlock) html += `<div class="card"><div class="card-head"><h2>解锁检测</h2><span class="sub">结果代表服务器出口 IP，所有客户端都一样</span></div>
     <div class="ipline"><span>出口 IP <b class="mono">${esc(r.unlock.ip.ip)}</b></span><span>地区 <b>${esc(r.unlock.ip.country)} · ${esc(r.unlock.ip.city)}</b></span><span>运营商 <b>${esc(r.unlock.ip.org)}</b></span></div>
     <div class="results">${r.unlock.checks.map((x) => row(x.level, x.name, x.text)).join('')}</div></div>`;
@@ -432,6 +467,29 @@ const ACTIONS = {
     S.results[id] = { ...(S.results[id] || {}), check: r.rows };
     toast(r.rows.every((x) => x.ok !== false) ? '端口和订阅都能从外部访问' : '有端口从外部连不上，请检查安全组', r.rows.some((x) => x.ok === false));
   }),
+  linecheck: () => busyRun('linecheck', async (id) => {
+    toast('正在体检：路由、延迟、下载，大约一分钟……');
+    const r = await api('POST', `/servers/${id}/linecheck`);
+    S.results[id] = { ...(S.results[id] || {}), line: r };
+  }),
+  toggle: (el) => {
+    const st = S.status[S.current], o = st.options, key = el.dataset.key;
+    const body = {};
+    let text;
+    if (key === 'hopping') { body.hopping = !o.port_hopping; text = body.hopping ? '开启 Hy2 端口跳跃' : '关闭 Hy2 端口跳跃'; }
+    else if (key === 'obfs') { body.obfs = !o.hy2_obfs; text = body.obfs ? '开启 Hy2 混淆' : '关闭 Hy2 混淆（所有 Hy2 客户端都必须更新订阅后才能连上）'; }
+    else {
+      const set = new Set(o.extra_protocols);
+      set.has(key) ? set.delete(key) : set.add(key);
+      body.protocols = [...set];
+      text = (set.has(key) ? '开启 ' : '关闭 ') + (key === 'tuic' ? 'TUIC' : 'AnyTLS');
+    }
+    const opening = body.hopping === true || (body.protocols && body.protocols.includes(key));
+    confirmModal(text, `${opening ? '开启前请确认云安全组已放行对应端口（开启后这里会列出完整的端口清单）。' : ''}服务器会校验新配置，失败自动恢复。各客户端"更新订阅"后生效，更新前旧节点照常可用。`, '确认', false, async () => {
+      await api('POST', `/servers/${S.current}/options`, body);
+      closeModal(); toast('已更新'); loadStatus(S.current);
+    });
+  },
   unlock: () => busyRun('unlock', async (id) => {
     toast('正在检测，大约需要半分钟……');
     const r = await api('POST', `/servers/${id}/unlock`);

@@ -25,11 +25,24 @@ def expected_ports(raw, ssh_port=22):
     if type(ssh_port) is not int or not 1 <= ssh_port <= 65535:
         raise ValueError('SSH 端口必须是 1–65535 的整数')
     subscriptions = [x['port'] for x in render.subscription_endpoints(s)]
-    proxies = render.proxy_ports(s)
-    if ssh_port in proxies + subscriptions:
+    if ssh_port in render.proxy_ports(s) + subscriptions:
         raise ValueError('SSH 端口不能与代理端口或订阅端口冲突')
-    return ([f'TCP:{ssh_port}'] + [f'TCP:{port}' for port in subscriptions]
-            + [f'{proto}:{port}' for port in proxies for proto in ('TCP', 'UDP')] + ['ICMP'])
+    return [f'TCP:{ssh_port}'] + [f'TCP:{port}' for port in subscriptions] + list(proxy_notes(s)) + ['ICMP']
+
+
+def proxy_notes(s):
+    """Ordered {'PROTO:port[-last]': note} for every proxy port this deployment listens on."""
+    notes = {}
+    for name, x in render.port_layout(s).items():
+        who = ' · ' + name if name else ''
+        notes[f"TCP:{x['main']}"] = 'VLESS REALITY' + who
+        notes[f"UDP:{x['main']}"] = 'Hysteria2' + who
+        if s['extra_protocols']:
+            notes[f"TCP:{x['alt']}"] = 'AnyTLS' + who
+            notes[f"UDP:{x['alt']}"] = 'TUIC' + who
+        if s['port_hopping']:
+            notes[f"UDP:{x['hop'][0]}-{x['hop'][1]}"] = 'Hy2 端口跳跃' + who
+    return notes
 
 
 def rule(protocol, source, note):
@@ -46,15 +59,9 @@ def generate(raw, ssh_sources=None, ssh_port=22, allow_world_ssh=False):
     if WORLD in sources and not allow_world_ssh:
         raise ValueError('SSH 对全网开放需显式指定 --allow-world-ssh')
     rows = [rule(ports[0], source, 'SSH 管理（建议收窄来源）') for source in sources]
-    s = render.settings(raw)
-    owners = dict(zip(render.proxy_ports(s), s['users'])) if s['users'] else {}
+    notes = proxy_notes(render.settings(raw))
     for port in ports[1:-1]:
-        proto, number = port.split(':')
-        if port.startswith('TCP:') and int(number) not in render.proxy_ports(s):
-            rows.append(rule(port, WORLD, '订阅下载'))
-        else:
-            who = (' · ' + owners[int(number)]) if int(number) in owners else ''
-            rows.append(rule(port, WORLD, ('VLESS REALITY' if proto == 'TCP' else 'Hysteria2') + who))
+        rows.append(rule(port, WORLD, notes.get(port, '订阅下载')))
     rows.append(rule('ICMP', WORLD, '诊断及路径 MTU'))
     result = {'data': rows}
     report = check(raw, result, ssh_port)
@@ -84,8 +91,9 @@ def check(raw, document, ssh_port=22):
             errors.append(label + '本工程模板仅支持 接受 / 高优先级 / 文本备注')
             continue
         protocol = row['协议及端口']
-        if not isinstance(protocol, str) or not re.fullmatch(r'(?:TCP|UDP):[1-9][0-9]{0,4}|ICMP', protocol):
-            errors.append(label + '协议格式应为 TCP:端口、UDP:端口或 ICMP')
+        if not isinstance(protocol, str) or not re.fullmatch(
+                r'(?:TCP|UDP):[1-9][0-9]{0,4}(?:-[1-9][0-9]{0,4})?|ICMP', protocol):
+            errors.append(label + '协议格式应为 TCP:端口、UDP:端口、UDP:起-止或 ICMP')
             continue
         if protocol not in ports:
             errors.append(label + '非本部署必需的协议/端口（含 RDP 3389 时应移除）')

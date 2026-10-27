@@ -39,9 +39,20 @@ def inspect_command(args):
 
 
 def required_ports(settings):
-    from render import proxy_ports
-    proxies = [(proto, port) for port in proxy_ports(settings) for proto in ('tcp', 'udp')]
-    return proxies + [('tcp', x['port']) for x in subscription_endpoints(settings)]
+    """(proto, port) pairs; a port is an int or a (first, last) range."""
+    from render import port_layout
+    pairs = []
+    for x in port_layout(settings).values():
+        pairs += [(proto, x['main']) for proto in ('tcp', 'udp')]
+        if settings.get('extra_protocols'):
+            pairs += [(proto, x['alt']) for proto in ('tcp', 'udp')]
+        if settings.get('port_hopping'):
+            pairs.append(('udp', tuple(x['hop'])))
+    return pairs + [('tcp', x['port']) for x in subscription_endpoints(settings)]
+
+
+def port_text(port, sep='-'):
+    return f'{port[0]}{sep}{port[1]}' if isinstance(port, tuple) else str(port)
 
 
 def file_digests():
@@ -55,7 +66,7 @@ def file_digests():
 
 def inspect(settings):
     report = {'backend': 'unknown', 'status': 'manual-review', 'required_ports':
-              [f'{proto.upper()} {port}' for proto, port in required_ports(settings)],
+              [f'{proto.upper()} {port_text(port)}' for proto, port in required_ports(settings)],
               'cloud_status': 'unverified', 'public_reachability': 'unverified',
               'warnings': [CLOUD_WARNING]}
     if shutil.which('firewall-cmd'):
@@ -102,9 +113,9 @@ def inspect(settings):
             report['warnings'].append('无法读取 nftables；防火墙状态未知。')
             return report
         observed = True
-        # gowest's own per-URL counter table is not an administrator policy.
+        # gowest's own counter and port-hopping tables are not administrator policy.
         others = [line for line in result.stdout.splitlines()
-                  if line.strip() and line.strip() != 'table inet la_vpn_acct']
+                  if line.strip() and line.strip() not in ('table inet la_vpn_acct', 'table inet la_vpn_hop')]
         if others:
             report['warnings'].append('检测到原生 nftables 规则；不覆盖自定义策略，请人工放行。')
             return report
@@ -118,7 +129,7 @@ def inspect(settings):
 
 def rule_args(proto, port, tag):
     return ['allow', 'in', 'proto', proto, 'from', 'any', 'to', 'any',
-            'port', str(port), 'comment', tag]
+            'port', port_text(port, ':'), 'comment', tag]
 
 
 def overlaps_existing(proto, port):
@@ -142,7 +153,8 @@ def overlaps_existing(proto, port):
                 match = re.fullmatch(r'(\d+)(?::(\d+))?', part)
                 if not match:
                     raise RuntimeError('UFW 端口格式未知；拒绝自动修改')
-                if int(match[1]) <= port <= int(match[2] or match[1]):
+                first, last = port if isinstance(port, tuple) else (port, port)
+                if int(match[1]) <= last and first <= int(match[2] or match[1]):
                     return True
     return False
 
@@ -184,7 +196,7 @@ def add_rules(journal, report, pairs, overlaps, tag, state, save):
         if file_digests() != journal['expected']:
             raise RuntimeError('UFW 规则在部署期间被外部修改；停止自动配置')
         if overlaps[(proto, port)] or overlaps_existing(proto, port):
-            report['warnings'].append(f'{proto.upper()} {port} 已有重叠规则，保留原规则；请确认来源范围及 IPv4/IPv6 覆盖。')
+            report['warnings'].append(f'{proto.upper()} {port_text(port)} 已有重叠规则，保留原规则；请确认来源范围及 IPv4/IPv6 覆盖。')
             continue
         args = rule_args(proto, port, tag)
         entry = {'args': args, 'status': 'intent'}

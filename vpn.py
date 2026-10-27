@@ -28,6 +28,7 @@ import kit_runtime
 from installlog import InstallLog, redact
 from render import (dump, render, settings, SUBSCRIPTION_FILES, account_dir, accounts, client_files, shape_mbps,
                     proxy_ports, share_plan, format_gb, server_config, nginx_config, write_account, KIT_VERSION,
+                    port_layout, cloud_ports, hop_ruleset, SPEEDTEST_BYTES,
                     android_guide_text, desktop_guide_text, shadowrocket_guide_text, subscription_endpoints)
 
 HERE = Path(__file__).resolve().parent
@@ -49,7 +50,7 @@ PROGRAM_FILES = ('vpn.py', 'render.py', 'routing.py', 'network.py', 'subinfo.py'
                  'deploy.sh', 'firewall.py', 'autoconfig.py', 'hostfirewall.py',
                  'kit_runtime.py', 'installlog.py', 'accounting.py', 'unlock.py')
 SERVICES = ['la-vpn.service', 'la-vpn-subscription.service', 'la-vpn-fq.service',
-            'la-vpn-subinfo.service', 'la-vpn-subinfo.timer']
+            'la-vpn-subinfo.service', 'la-vpn-subinfo.timer', 'la-vpn-hop.service']
 
 
 @contextlib.contextmanager
@@ -216,8 +217,9 @@ def preflight(s, confirm):
     if int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines()
                 if line.startswith('MemTotal:'))) < 500000:
         raise RuntimeError('At least 512 MiB RAM is required for this tuning profile')
-    for proto, ports in [('tcp', proxy_ports(s) + [x['port'] for x in subscription_endpoints(s)]),
-                         ('udp', proxy_ports(s))]:
+    alts = [x['alt'] for x in port_layout(s).values()] if s['extra_protocols'] else []
+    for proto, ports in [('tcp', proxy_ports(s) + alts + [x['port'] for x in subscription_endpoints(s)]),
+                         ('udp', proxy_ports(s) + alts)]:
         for port in ports:
             result = run(['ss', '-H', '-ln' + ('t' if proto == 'tcp' else 'u'), f'sport = :{port}'])
             if result.stdout.strip():
@@ -387,6 +389,19 @@ Type=oneshot
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart={stats}
 ''',
+        'la-vpn-hop.service': '''[Unit]
+Description=Hy2 port hopping redirect (gowest's own nftables table only)
+Wants=network-pre.target
+After=network-pre.target
+Before=la-vpn.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/la-vpn/hop.nft
+ExecStop=-/usr/sbin/nft delete table inet la_vpn_hop
+[Install]
+WantedBy=multi-user.target
+''',
         'la-vpn-subinfo.timer': '''[Unit]
 Description=Update subscription traffic display every five minutes
 [Timer]
@@ -416,10 +431,16 @@ def verify(s):
         run(['systemctl', 'is-active', '--quiet', name])
     run([str(PROGRAM / 'bin/sing-box'), 'check', '-c', str(CONFIG / 'server.json')])
     run(['nginx', '-t', '-c', str(CONFIG / 'nginx.conf')])
-    for port in proxy_ports(cfg):
-        for proto in ('t', 'u'):
-            if not run(['ss', '-H', '-ln' + proto, f'sport = :{port}']).stdout.strip():
-                raise RuntimeError(f'Proxy listener missing on port {port}')
+    cfg = settings(cfg)
+    listeners = [(port, proto) for port in proxy_ports(cfg) for proto in ('t', 'u')]
+    for x in port_layout(cfg).values():
+        listeners += [(x['alt'], proto) for proto, name in (('t', 'anytls'), ('u', 'tuic'))
+                      if name in cfg['extra_protocols']]
+    for port, proto in listeners:
+        if not run(['ss', '-H', '-ln' + proto, f'sport = :{port}']).stdout.strip():
+            raise RuntimeError(f'Proxy listener missing on port {port}')
+    if cfg['port_hopping']:
+        run(['nft', 'list', 'table', 'inet', 'la_vpn_hop'])
     for user in cfg['users'] or ['']:
         verify_account(cfg, user)
     # This is deliberately local validation, not a fabricated end-to-end throughput check.
@@ -535,7 +556,8 @@ def install(cfg, confirm, firewall_mode='auto'):
             os.chmod(CONFIG, 0o755)
             for name, mode, group in [('server.json', 0o640, 'la-vpn'), ('hy2.key', 0o640, 'la-vpn'),
                                       ('hy2.crt', 0o644, None), ('settings.json', 0o600, None),
-                                      ('nginx.conf', 0o600, None), ('subinfo.conf', 0o644, None)]:
+                                      ('nginx.conf', 0o600, None), ('subinfo.conf', 0o644, None),
+                                      ('hop.nft', 0o600, None)]:
                 managed_file(s, CONFIG / name, (out / name).read_bytes(), mode, group)
             s['files'].pop(str(CONFIG / 'subinfo.conf'))  # Stats intentionally change this file.
             save_state(s)
@@ -551,6 +573,7 @@ def install(cfg, confirm, firewall_mode='auto'):
             if cfg['subscription']['scheme'] == 'https':
                 for key, name in [('certificate', 'subscription-fullchain.pem'), ('private_key', 'subscription-privkey.pem')]:
                     managed_file(s, CONFIG / name, Path(cfg['subscription'][key]).read_bytes(), 0o600)
+            ensure_speedtest()
             run([str(PROGRAM / 'bin/sing-box'), 'check', '-c', str(CONFIG / 'server.json')])
         with log.step(6, '应用保守网络配置并启动专属服务'):
             net = network.apply(STATE / 'network.json', plan=share_plan(cfg))
@@ -563,7 +586,7 @@ def install(cfg, confirm, firewall_mode='auto'):
             for name, text in service_files(dev).items():
                 managed_file(s, UNITS / name, text)
             run(['systemctl', 'daemon-reload'])
-            run(['systemctl', 'enable', '--now', 'la-vpn-fq.service', 'la-vpn.service',
+            run(['systemctl', 'enable', '--now', 'la-vpn-fq.service', 'la-vpn-hop.service', 'la-vpn.service',
                  'la-vpn-subscription.service', 'vnstat.service'], timeout=90)
             run(['vnstat', '--add', '-i', dev], check=False)
         with log.step(7, '校验本机监听、订阅内容与主机防火墙'):
@@ -584,9 +607,7 @@ def install(cfg, confirm, firewall_mode='auto'):
         log.emit('下一步', '分端说明：sudo ' + entry + ' urls --client mac|windows|android|shadowrocket')
         if s['host_firewall']['report']['status'] in ('manual-review', 'check-only-no-changes', 'ufw-overlap-needs-review'):
             log.emit('待处理', '本机防火墙尚需人工处理；不能视为公网部署完成。')
-        ports = '、'.join([f'{p} {n}' for n in proxy_ports(cfg) for p in ('TCP', 'UDP')]
-                         + ['TCP ' + str(x['port']) for x in subscription_endpoints(cfg)])
-        log.emit('待处理', '云安全组未验证：请确认 ' + ports + '；再由外部客户端验收。')
+        log.emit('待处理', '云安全组未验证：请确认放行 ' + '、'.join(cloud_ports(cfg)) + '；再由外部客户端验收。')
     except BaseException:
         log.emit('回滚开始', '安装未完成；尝试回滚受管改动，保留已安装依赖。')
         try:
@@ -620,8 +641,10 @@ def rollback(automatic=False):
     s['status'] = 'rolling-back'
     save_state(s)
     for name in ['la-vpn-subinfo.timer', 'la-vpn-subinfo.service', 'la-vpn-subscription.service',
-                 'la-vpn.service', 'la-vpn-fq.service']:
+                 'la-vpn.service', 'la-vpn-hop.service', 'la-vpn-fq.service']:
         run(['systemctl', 'disable', '--now', name], check=False)
+    if shutil.which('nft'):
+        run(['nft', 'delete', 'table', 'inet', 'la_vpn_hop'], check=False)
     if net.exists():
         network.restore(net)
     if shutil.which('nft'):
@@ -759,6 +782,49 @@ def sing_box_version():
     return words[2] if len(words) > 2 and words[:2] == ['sing-box', 'version'] else ''
 
 
+def ensure_speedtest():
+    """The private line-check download: incompressible-enough zeros (no gzip is configured)."""
+    path = CONFIG / 'speedtest.bin'
+    if path.is_file() and path.stat().st_size == SPEEDTEST_BYTES:
+        return
+    tmp = CONFIG / '.speedtest.bin.new'
+    with tmp.open('wb') as f:
+        f.truncate(SPEEDTEST_BYTES)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def change_options(confirm, hopping=None, protocols=None, obfs=None):
+    """Turn port hopping, the extra protocols and Hy2 obfuscation on or off.
+
+    Keys, ports and subscription URLs stay the same; clients pick the change up
+    on their next subscription update (until then their old nodes keep working)."""
+    s, cfg = installed(confirm)
+    before = settings(dict(cfg))
+    if hopping is not None:
+        cfg['port_hopping'] = hopping
+    if protocols is not None:
+        cfg['extra_protocols'] = protocols
+    if obfs is not None:
+        cfg['hy2_obfs'] = obfs
+    cfg = settings(cfg)
+    keys = load_keys()
+    ensure_speedtest()
+    reconcile(s, config_targets(cfg, keys), cfg, keys)
+    after_users_change(s, cfg)
+    new_pairs = [pair for pair in hostfirewall.required_ports(cfg) if pair not in hostfirewall.required_ports(before)]
+    if new_pairs:
+        if hostfirewall.add_ports(cfg, s, save_state, new_pairs):
+            print('本机防火墙已放行新增端口。')
+        else:
+            print('请确认本机防火墙放行：' + '、'.join(f'{p.upper()} {hostfirewall.port_text(n)}' for p, n in new_pairs))
+    print('当前：端口跳跃 ' + ('开' if cfg['port_hopping'] else '关') + '；备用协议 '
+          + ('、'.join(x.upper() if x == 'tuic' else 'AnyTLS' for x in cfg['extra_protocols']) or '无')
+          + '；Hy2 混淆 ' + ('开' if cfg['hy2_obfs'] else '关') + '。')
+    print('云安全组需要放行：' + '、'.join(cloud_ports(cfg)))
+    print('客户端"更新订阅"后生效；更新前旧的节点仍可使用。')
+
+
 def load_keys():
     return json.loads((STATE / 'generated/secrets.json').read_text())
 
@@ -767,7 +833,8 @@ def config_targets(cfg, keys):
     """Every owned file derived from settings + keys, as path -> (bytes, mode, group)."""
     targets = {CONFIG / 'settings.json': (dump(cfg).encode(), 0o600, None),
                CONFIG / 'server.json': (dump(server_config(cfg, keys)).encode(), 0o640, 'la-vpn'),
-               CONFIG / 'nginx.conf': (nginx_config(cfg, keys).encode(), 0o600, None)}
+               CONFIG / 'nginx.conf': (nginx_config(cfg, keys).encode(), 0o600, None),
+               CONFIG / 'hop.nft': (hop_ruleset(cfg).encode(), 0o600, None)}
     for account in accounts(cfg, keys):
         for name, body in client_files(cfg, account).items():
             targets[served_dir(account['name']) / name] = (body.encode(), 0o640, 'www-data')
@@ -827,6 +894,7 @@ def reconcile(s, targets, cfg, keys, removed=()):
         restart.append('la-vpn.service')
     if names & {'nginx.conf', 'la-vpn-subscription.service'}:
         restart.append('la-vpn-subscription.service')
+    hop = bool(names & {'hop.nft', 'la-vpn-hop.service'})
     try:
         for path, (data, mode, group) in changed.items():
             if str(path) in s['files']:
@@ -841,6 +909,10 @@ def reconcile(s, targets, cfg, keys, removed=()):
         run(['systemctl', 'daemon-reload'])
         run([str(PROGRAM / 'bin/sing-box'), 'check', '-c', str(CONFIG / 'server.json')])
         run(['nginx', '-t', '-c', str(CONFIG / 'nginx.conf')])
+        if hop:
+            # Redirects load before the proxy restarts; enable covers upgrades from older units.
+            run(['systemctl', 'enable', 'la-vpn-hop.service'])
+            run(['systemctl', 'restart', 'la-vpn-hop.service'], timeout=60)
         if restart:
             run(['systemctl', 'restart'] + restart, timeout=90)
         verify_started(s)
@@ -863,6 +935,8 @@ def reconcile(s, targets, cfg, keys, removed=()):
         shutil.rmtree(generated)
         saved.rename(generated)
         run(['systemctl', 'daemon-reload'], check=False)
+        if hop and (CONFIG / 'hop.nft').exists():
+            run(['systemctl', 'restart', 'la-vpn-hop.service'], check=False, timeout=60)
         if restart:
             run(['systemctl', 'restart'] + restart, check=False, timeout=90)
         raise
@@ -890,6 +964,7 @@ def upgrade(confirm):
     if missing and run(['apt-get', 'install', '-y', '--no-install-recommends'] + missing,
                        check=False, timeout=600).returncode:
         print('未能安装 ' + '、'.join(missing) + '；分链接统计或二维码暂不可用，可稍后重试 upgrade。')
+    ensure_speedtest()
     restart = reconcile(s, targets, cfg, keys)
     s['kit_version'] = KIT_VERSION
     save_state(s)
@@ -978,7 +1053,10 @@ def status_report():
             'traffic': {'month': traffic.get('month'), 'used_bytes': traffic.get('used_bytes'),
                         'quota_bytes': cfg['traffic']['total_bytes'], 'metering': cfg['traffic']['metering'],
                         'on_exceed': cfg['traffic']['on_exceed'], 'paused_month': traffic.get('paused_month')},
-            'single': not cfg['users'], 'users': user_rows(cfg) if cfg['users'] else []}
+            'single': not cfg['users'], 'users': user_rows(cfg) if cfg['users'] else [],
+            'options': {'port_hopping': cfg['port_hopping'], 'extra_protocols': cfg['extra_protocols'],
+                        'hy2_obfs': cfg['hy2_obfs']},
+            'cloud_ports': cloud_ports(cfg)}
 
 
 def url_report(user):
@@ -1125,6 +1203,11 @@ def main(argv=None):
     item = sub.add_parser('unlock', help='检测这台服务器的 IP 能否使用 Claude、ChatGPT、TikTok、YouTube')
     item.add_argument('--json', action='store_true', help=argparse.SUPPRESS)
     sub.add_parser('endpoints', help=argparse.SUPPRESS)
+    item = sub.add_parser('options', help='开关端口跳跃、备用协议（TUIC、AnyTLS）和 Hy2 混淆')
+    item.add_argument('--hopping', choices=('on', 'off'))
+    item.add_argument('--protocols', help='tuic,anytls 中任选，none 表示只用 Hy2 + VLESS')
+    item.add_argument('--obfs', choices=('on', 'off'))
+    item.add_argument('--confirm-server', required=True)
     item = sub.add_parser('upgrade', help='用当前这份代码升级已安装的服务器；密钥和订阅地址不变')
     item.add_argument('--confirm-server', required=True)
     item = sub.add_parser('rollback')
@@ -1136,8 +1219,8 @@ def main(argv=None):
         if args.command == 'plan':
             print(dump({'operation': 'PLAN ONLY — no changes', 'target': cfg['server_ip'],
                         'supported_os': 'Ubuntu 24.04 amd64/arm64 with systemd', 'sing_box_version': VERSION,
-                        'ports': [f'{p} {n}' for n in proxy_ports(cfg) for p in ('TCP', 'UDP')]
-                                 + ['TCP ' + str(x['port']) for x in subscription_endpoints(cfg)],
+                        'cloud_security_group': cloud_ports(cfg),
+                        'port_hopping': cfg['port_hopping'], 'extra_protocols': cfg['extra_protocols'],
                         'owned_roots': [str(CONFIG), str(PROGRAM), str(STATE)],
                         'network': network.PARAMETERS,
                         'qdisc_policy': ('per-URL HTB fair share on an untouched default root; custom queues left alone'
@@ -1187,6 +1270,15 @@ def main(argv=None):
             raise RuntimeError('users set 需要 --cap、--quota 或 --expire')
         with exclusive_operation():
             change_users(args.confirm_server, args.action, args.name, args.cap, args.quota, args.expire)
+    elif args.command == 'options':
+        if args.hopping is None and args.protocols is None and args.obfs is None:
+            raise RuntimeError('请指定 --hopping、--protocols 或 --obfs')
+        protocols = None
+        if args.protocols is not None:
+            protocols = [] if args.protocols in ('none', '') else [x.strip().lower() for x in args.protocols.split(',')]
+        with exclusive_operation():
+            change_options(args.confirm_server, None if args.hopping is None else args.hopping == 'on',
+                           protocols, None if args.obfs is None else args.obfs == 'on')
     elif args.command == 'unlock':
         import unlock
         if args.json:
@@ -1198,9 +1290,13 @@ def main(argv=None):
         cfg = settings(json.loads((CONFIG / 'settings.json').read_text()))
         first = account_dir(cfg['users'][0] if cfg['users'] else '')
         url = (STATE / 'generated' / first / 'subscription-urls.txt').read_text().splitlines()[0].split(': ', 1)[1]
+        layout = port_layout(cfg).values()
         print(json.dumps({'server_ip': cfg['server_ip'], 'proxy_ports': proxy_ports(cfg),
+                          'alt_ports': [x['alt'] for x in layout] if 'anytls' in cfg['extra_protocols'] else [],
+                          'tuic_ports': [x['alt'] for x in layout] if 'tuic' in cfg['extra_protocols'] else [],
+                          'hop_ranges': [list(x['hop']) for x in layout] if cfg['port_hopping'] else [],
                           'subscription_ports': [x['port'] for x in subscription_endpoints(cfg)],
-                          'subscription_url': url}))
+                          'subscription_url': url, 'speedtest_url': url + '-speedtest'}))
     elif args.command == 'upgrade':
         signal.signal(signal.SIGHUP, on_hangup)
         with exclusive_operation():

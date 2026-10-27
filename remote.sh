@@ -7,6 +7,7 @@
 #   ./remote.sh root@203.0.113.7                    首次安装（中文向导）
 #   ./remote.sh root@203.0.113.7 quick 100Mbps      零问答安装（可加 --users 3）
 #   ./remote.sh root@203.0.113.7 check             从这台电脑测端口和订阅是否通
+#   ./remote.sh root@203.0.113.7 linecheck         线路体检：路由类型、延迟丢包、下载速度
 #   ./remote.sh root@203.0.113.7 upgrade           升级为本机这份代码；密钥和订阅地址不变
 #   ./remote.sh root@203.0.113.7 users add dave    其他管理：status / urls / users / unlock / bandwidth / traffic …
 #
@@ -21,7 +22,7 @@ if [ "${1:-}" = ui ]; then
     exec python3 "$kit_dir/gowest_ui.py" "$@"
 fi
 if [ $# -lt 1 ] || [ "$1" = -h ] || [ "$1" = --help ]; then
-    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
 fi
 target=$1
@@ -56,10 +57,13 @@ with_ip() {
     args=$*
 }
 
+endpoints() {
+    ssh "$target" "if [ -x /opt/la-vpn/gowest ]; then sudo /opt/la-vpn/gowest endpoints; else sudo bash /opt/la-vpn/deploy.sh endpoints; fi"
+}
+
 check() {
     # Outside-in: what a client on the internet sees, which the server itself cannot tell.
-    info=$(ssh "$target" "if [ -x /opt/la-vpn/gowest ]; then sudo /opt/la-vpn/gowest endpoints; else sudo bash /opt/la-vpn/deploy.sh endpoints; fi")
-    python3 "$kit_dir/localcheck.py" "$info"
+    python3 "$kit_dir/localcheck.py" "$(endpoints)"
 }
 
 action=$1
@@ -81,6 +85,9 @@ case $action in
         echo "→ 从这台电脑检查外网连通性"
         check
         exit ;;
+    linecheck)
+        echo "→ 线路体检（不经过任何代理，约 1 分钟）"
+        exec python3 "$kit_dir/linecheck.py" "$(endpoints)" ;;
     users)
         case ${2:-list} in
             list) args=$* ;;
@@ -91,7 +98,7 @@ case $action in
         upload
         # Runs the uploaded (new) kit, which swaps itself into /opt/la-vpn.
         exec ssh -t "$target" "cd '$remote_dir' && sudo bash deploy.sh $args" ;;
-    bandwidth|traffic|repair-fq)
+    bandwidth|traffic|options|repair-fq)
         with_ip "$@" ;;
     *)
         args=$* ;;

@@ -26,6 +26,10 @@ def check(info):
         ok = tcp(ip, port)
         rows.append({'name': f'TCP {port}', 'ok': ok, 'text': '代理端口（VLESS）可连接' if ok
                      else '连不上：检查云安全组和本机防火墙'})
+    for port in info.get('alt_ports', []):
+        ok = tcp(ip, port)
+        rows.append({'name': f'TCP {port}', 'ok': ok, 'text': '备用协议端口（AnyTLS）可连接' if ok
+                     else '连不上：备用协议不可用，其他协议不受影响；检查安全组'})
     for port in info['subscription_ports']:
         ok = tcp(ip, port)
         rows.append({'name': f'TCP {port}', 'ok': ok, 'text': '订阅端口可连接' if ok
@@ -36,8 +40,11 @@ def check(info):
             rows.append({'name': '订阅下载', 'ok': True, 'text': f'成功（HTTP {response.status}）'})
     except Exception as error:
         rows.append({'name': '订阅下载', 'ok': False, 'text': '失败：' + type(error).__name__})
-    rows.append({'name': 'UDP ' + '、'.join(map(str, info['proxy_ports'])), 'ok': None,
-                 'text': 'Hy2 无法从外部探测；请确认安全组也放行了 UDP。Hy2 不通时客户端会自动改走 VLESS'})
+    udp = info['proxy_ports'] + info.get('tuic_ports', [])
+    udp = [str(p) for p in udp] + [f'{a}-{b}' for a, b in info.get('hop_ranges', [])]
+    rows.append({'name': 'UDP ' + '、'.join(udp), 'ok': None,
+                 'text': 'Hy2 / TUIC 无法从外部探测；请确认安全组也放行了这些 UDP 端口。'
+                         'UDP 不通时客户端会自动改走 VLESS'})
     return rows
 
 

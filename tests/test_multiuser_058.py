@@ -150,7 +150,7 @@ class MultiUserRenderTests(unittest.TestCase):
 
     def test_nginx_serves_each_user_folder(self):
         text = (self.out / 'nginx.conf').read_text()
-        self.assertEqual(text.count('location = /sub/'), 3 * len(render.SUBSCRIPTION_FILES))
+        self.assertEqual(text.count('location = /sub/'), 3 * (len(render.SUBSCRIPTION_FILES) + 1))
         self.assertIn('alias /etc/la-vpn/subscriptions/carol/strict.yaml;', text)
         self.assertNotIn('alias /etc/la-vpn/subscriptions/normal.yaml;', text)
 

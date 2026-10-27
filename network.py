@@ -140,8 +140,21 @@ def missing_modules():
     return [m for m in SHARE_MODULES if not loads(m)]
 
 
+def port_matches(user):
+    """u32 (value, mask) source-port matches for one share: exact ports plus the
+    64-aligned hop block, which a single mask covers."""
+    matches = [(user['port'], 0xffff)] + ([(user['alt'], 0xffff)] if user.get('alt') else [])
+    if user.get('hop'):
+        first, last = user['hop']
+        size = last - first + 1
+        if size & (size - 1) or first % size:
+            raise ValueError('Hop block must be a power-of-two size aligned to its size')
+        matches.append((first, 0xffff & ~(size - 1)))
+    return matches
+
+
 def share_classes(plan):
-    """classid -> (rate kbit, ceil kbit, leaf handle, port or None).
+    """classid -> (rate kbit, ceil kbit, leaf handle, source-port matches or None).
 
     Each subscription URL is one share: guaranteed total/N, may borrow up to its
     cap (default: the whole rate) while others are idle. A small default class
@@ -153,7 +166,7 @@ def share_classes(plan):
     for i, user in enumerate(plan['users'], 1):
         minor = format(0x10 + i, 'x')
         classes['1af2:' + minor] = (each, min(user['cap_mbps'] * 1000, total),
-                                    format(0x1b00 + 0x10 + i, 'x') + ':', user['port'])
+                                    format(0x1b00 + 0x10 + i, 'x') + ':', port_matches(user))
     return classes
 
 
@@ -161,7 +174,7 @@ def build_tree(dev, plan, verb='add'):
     classes = share_classes(plan)
     if verb == 'add':
         run('tc', 'qdisc', 'replace', 'dev', dev, 'root', 'handle', SHARE_HANDLE, 'htb', 'default', 'ff')
-    for classid, (rate, ceil, leaf, port) in classes.items():
+    for classid, (rate, ceil, leaf, matches) in classes.items():
         parent = SHARE_HANDLE if classid == '1af2:1' else '1af2:1'
         # HTB's round robin adds one quantum per turn yet always sends a whole
         # packet; with TSO/GSO packets up to 64 KiB a small quantum turns it into
@@ -174,10 +187,10 @@ def build_tree(dev, plan, verb='add'):
         if leaf:
             # fq_codel inside each share keeps one user's flows from queueing behind each other.
             run('tc', 'qdisc', 'add', 'dev', dev, 'parent', classid, 'handle', leaf, 'fq_codel')
-        if port:
+        for port, mask in matches or ():
             for proto, prio, match in (('ip', '1', 'ip'), ('ipv6', '2', 'ip6')):
                 run('tc', 'filter', 'add', 'dev', dev, 'parent', SHARE_HANDLE, 'protocol', proto,
-                    'prio', prio, 'u32', 'match', match, 'sport', str(port), '0xffff', 'flowid', classid)
+                    'prio', prio, 'u32', 'match', match, 'sport', str(port), hex(mask), 'flowid', classid)
 
 
 def to_kbit(text):
@@ -204,7 +217,7 @@ def owned_tree(dev, shaping):
         return False
     filters = json.loads(run('tc', '-j', 'filter', 'show', 'dev', dev, 'parent', SHARE_HANDLE) or '[]')
     flows = sorted(f['options']['flowid'] for f in filters if f.get('options', {}).get('flowid'))
-    return flows == sorted(c for c, v in expected.items() if v[3] for _ in range(2))
+    return flows == sorted(c for c, v in expected.items() for _ in range(2 * len(v[3] or ())))
 
 
 def shape(state_path, state, plan):
@@ -239,7 +252,7 @@ def set_plan(state_path, plan):
         raise RuntimeError('Per-URL fair share is not active on this server')
     if not owned_tree(state['interface'], shaping):
         raise RuntimeError('Managed share tree changed outside this installer; refusing change')
-    if [u['port'] for u in plan['users']] != [u['port'] for u in shaping['plan']['users']]:
+    if [port_matches(u) for u in plan['users']] != [port_matches(u) for u in shaping['plan']['users']]:
         raise RuntimeError('Users/ports differ from the installed tree; rate/cap changes only')
     build_tree(state['interface'], plan, 'change')
     if not owned_tree(state['interface'], dict(shaping, plan=plan)):
@@ -255,7 +268,7 @@ def replace_plan(state_path, plan):
     shaping = state.get('shaping') or {}
     if shaping.get('result') != 'applied':
         raise RuntimeError('Per-URL fair share is not active on this server')
-    if [u['port'] for u in plan['users']] == [u['port'] for u in shaping['plan']['users']]:
+    if [port_matches(u) for u in plan['users']] == [port_matches(u) for u in shaping['plan']['users']]:
         return set_plan(state_path, plan)
     dev = state['interface']
     if not owned_tree(dev, shaping):

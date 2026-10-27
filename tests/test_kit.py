@@ -113,7 +113,10 @@ class ConfigTests(unittest.TestCase):
 
     def test_nginx_only_allowlisted_secret_locations(self):
         text = (self.output / 'nginx.conf').read_text()
-        self.assertEqual(text.count('location = /sub/'), len(render.SUBSCRIPTION_FILES))
+        # Subscription files plus the private line-check download, nothing else.
+        self.assertEqual(text.count('location = /sub/'), len(render.SUBSCRIPTION_FILES) + 1)
+        self.assertEqual(text.count('-speedtest {'), 1)
+        self.assertEqual(text.count('alias /etc/la-vpn/speedtest.bin;'), 1)
         self.assertIn('location / { return 404; }', text)
         self.assertIn('access_log off', text)
         self.assertNotIn('/secrets.json', text)

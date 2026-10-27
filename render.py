@@ -20,7 +20,7 @@ import routing
 
 DOMAINS = routing.CLAUDE
 PROJECT_NAME = 'gowest'
-KIT_VERSION = '0.8.2'
+KIT_VERSION = '0.9.0'
 SELECT_GROUP = '出口选择'
 AUTO_GROUP = '自动回退'
 # Tailscale control plane stays direct on every Mihomo client:
@@ -29,6 +29,15 @@ TS_PROCESSES = ['tailscaled', 'Tailscale', 'io.tailscale.ipn.macsys.network-exte
                 'tailscaled.exe', 'tailscale-ipn.exe', 'com.tailscale.ipn']
 # Desktop client pinned by the clients/ installers; profiles use the same Mihomo YAML.
 DESKTOP_CLIENT = 'Clash Verge Rev 2.5.8'
+# Optional extra protocols on each URL's second port: TUIC (UDP) and AnyTLS (TCP).
+EXTRA_PROTOCOLS = ('tuic', 'anytls')
+SINGLE_ALT_PORT = 2443
+SPEEDTEST_BYTES = 16 * 2**20
+# Hy2 port hopping: each URL owns a 64-port block starting here. Blocks are
+# 64-aligned so the egress queue can classify a whole block with one u32 mask,
+# and they stay below the kernel's ephemeral range (32768+).
+HOP_BASE = 24576
+HOP_SIZE = 64
 USER_NAME = r'[a-z][a-z0-9-]{0,15}'
 MAX_USERS = 32
 METERING = ('both', 'outbound')
@@ -73,7 +82,7 @@ def settings(raw):
     allowed = {'server_ip', 'node_prefix', 'hy2_up_mbps', 'hy2_down_mbps', 'ipv6',
                'tailnet', 'hosts', 'reality_server_name', 'hy2_server_name',
                'subscription', 'traffic', 'users', 'fair_share', 'user_caps', 'user_port_base',
-               'user_ports', 'user_quota', 'user_expire'}
+               'user_ports', 'user_quota', 'user_expire', 'extra_protocols', 'port_hopping', 'hy2_obfs'}
     if set(raw) - allowed:
         raise ValueError('Unknown settings fields: ' + ', '.join(sorted(set(raw) - allowed)))
     s = copy.deepcopy(raw)
@@ -175,7 +184,54 @@ def settings(raw):
     reserved = {22, 443} | {x['port'] for x in subscription_endpoints(s)}
     if users and reserved & set(proxy_ports(s)):
         raise ValueError('Per-user proxy ports collide with SSH, 443 or subscription ports')
+    extra = s.setdefault('extra_protocols', [])
+    if type(extra) is not list or len(set(extra)) != len(extra) or set(extra) - set(EXTRA_PROTOCOLS):
+        raise ValueError('extra_protocols may only contain ' + ', '.join(EXTRA_PROTOCOLS))
+    s['extra_protocols'] = [p for p in EXTRA_PROTOCOLS if p in extra]
+    for key, default in (('port_hopping', False), ('hy2_obfs', True)):
+        if type(s.setdefault(key, default)) is not bool:
+            raise ValueError(key + ' must be boolean')
+    layout = port_layout(s)
+    mains = set(proxy_ports(s))
+    if s['extra_protocols']:
+        alts = [x['alt'] for x in layout.values()]
+        if any(not 1025 <= p <= 32767 for p in alts if p != SINGLE_ALT_PORT) or len(set(alts)) != len(alts) \
+                or set(alts) & (mains | reserved):
+            raise ValueError('Second ports (TUIC/AnyTLS) collide with other ports or leave 1025-32767')
+    if s['port_hopping']:
+        if any(not HOP_BASE <= x['hop'][0] or x['hop'][1] > 32767 for x in layout.values()):
+            raise ValueError('Port hopping needs per-user ports within user_port_base+1..+64')
+        busy = mains | reserved | ({x['alt'] for x in layout.values()} if s['extra_protocols'] else set())
+        if any(x['hop'][0] <= p <= x['hop'][1] for x in layout.values() for p in busy):
+            raise ValueError('Port hopping range overlaps another port')
     return s
+
+
+def port_layout(s):
+    """name -> {'main', 'alt', 'hop': (first, last)} for every subscription URL.
+
+    main: VLESS (TCP) + Hy2 (UDP); alt: AnyTLS (TCP) + TUIC (UDP); hop: the
+    UDP block redirected to main for Hy2 port hopping. All derive from the
+    URL's pinned port, so they never move when other URLs change."""
+    result = {}
+    for name, port in zip(s['users'] or [''], proxy_ports(s)):
+        offset = port - s['user_port_base'] - 1 if s['users'] else 0
+        first = HOP_BASE + offset * HOP_SIZE
+        result[name] = {'main': port, 'alt': port + 1000 if s['users'] else SINGLE_ALT_PORT,
+                        'hop': (first, first + HOP_SIZE - 1)}
+    return result
+
+
+def cloud_ports(s):
+    """What the cloud security group must allow, as short human-readable rules."""
+    layout = list(port_layout(s).values())
+    span = lambda values: str(min(values)) + ('-' + str(max(values)) if len(values) > 1 else '')
+    rules = ['TCP/UDP ' + span([x['main'] for x in layout])]
+    if s['extra_protocols']:
+        rules.append('TCP/UDP ' + span([x['alt'] for x in layout]))
+    if s['port_hopping']:
+        rules.append(f"UDP {layout[0]['hop'][0]}-{max(x['hop'][1] for x in layout)}")
+    return rules + ['TCP ' + str(x['port']) for x in subscription_endpoints(s)]
 
 
 def parse_date(text):
@@ -240,8 +296,13 @@ def share_plan(s):
     if not s['fair_share']:
         return None
     total = shape_mbps(s)
+    layout = port_layout(s)
+    # Every port a URL can be reached on belongs to its share: main, the extra
+    # protocols' port, and (after the kernel un-NATs replies) its hop block.
     return {'rate_mbps': total, 'users': [
-        {'name': name, 'port': port, 'cap_mbps': min(s['user_caps'].get(name, total), total)}
+        dict({'name': name, 'port': port, 'cap_mbps': min(s['user_caps'].get(name, total), total)},
+             **({'alt': layout[name]['alt']} if s['extra_protocols'] else {}),
+             **({'hop': list(layout[name]['hop'])} if s['port_hopping'] else {}))
         for name, port in zip(s['users'], proxy_ports(s))]}
 
 
@@ -249,9 +310,11 @@ def accounts(s, k):
     """Per-user credentials merged with the shared server keys.
 
     Without named users this is the legacy single account (flat file layout)."""
+    layout = port_layout(s)
     if not s['users']:
-        return [dict(k, name='', port=443)]
-    return [dict(k, port=port, **user) for user, port in zip(k['users'], proxy_ports(s))]
+        return [dict(k, name='', port=443, alt=layout['']['alt'], hop=layout['']['hop'])]
+    return [dict(k, port=port, alt=layout[user['name']]['alt'], hop=layout[user['name']]['hop'], **user)
+            for user, port in zip(k['users'], proxy_ports(s))]
 
 
 def new_credentials():
@@ -289,15 +352,29 @@ def make_secrets(out, s):
 
 
 def server_config(s, k):
-    if not s['users']:
-        return {'log': {'level': 'warn'}, 'inbounds': inbound_pair(s, k, accounts(s, k), 443, ''),
-                'outbounds': [{'type': 'direct'}]}
-    # Shared mode: each URL owns a port, which is how the egress queue tells
+    # Shared mode: each URL owns its ports, which is how the egress queue tells
     # users apart (packets to clients carry no user identity otherwise).
     inbounds = []
     for a in accounts(s, k):
-        inbounds += inbound_pair(s, k, [a], a['port'], '-' + a['name'])
+        suffix = '-' + a['name'] if a['name'] else ''
+        inbounds += inbound_pair(s, k, [a], a['port'], suffix) + extra_inbounds(s, a, suffix)
     return {'log': {'level': 'warn'}, 'inbounds': inbounds, 'outbounds': [{'type': 'direct'}]}
+
+
+def extra_inbounds(s, a, suffix):
+    """TUIC (UDP) and AnyTLS (TCP) share the URL's second port; same pinned certificate as Hy2."""
+    named = dict({'name': a['name']} if a['name'] else {})
+    tls = {'enabled': True, 'certificate_path': '/etc/la-vpn/hy2.crt', 'key_path': '/etc/la-vpn/hy2.key'}
+    result = []
+    if 'tuic' in s['extra_protocols']:
+        result.append({'type': 'tuic', 'tag': 'tuic-in' + suffix, 'listen': '::', 'listen_port': a['alt'],
+                       'users': [dict(named, uuid=a['uuid'], password=a['hy2_password'])],
+                       'congestion_control': 'bbr', 'auth_timeout': '3s', 'zero_rtt_handshake': False,
+                       'heartbeat': '10s', 'tls': dict(tls, alpn=['h3'])})
+    if 'anytls' in s['extra_protocols']:
+        result.append({'type': 'anytls', 'tag': 'anytls-in' + suffix, 'listen': '::', 'listen_port': a['alt'],
+                       'users': [dict(named, password=a['hy2_password'])], 'tls': tls})
+    return result
 
 
 def inbound_pair(s, k, users, port, suffix):
@@ -311,7 +388,7 @@ def inbound_pair(s, k, users, port, suffix):
                              'private_key': k['reality_private_key'], 'short_id': [k['short_id']]}}},
         {'type': 'hysteria2', 'tag': 'hy2-in' + suffix, 'listen': '::', 'listen_port': port,
          'users': [named(a, {'password': a['hy2_password']}) for a in users],
-         'obfs': {'type': 'salamander', 'password': k['obfs_password']},
+         **({'obfs': {'type': 'salamander', 'password': k['obfs_password']}} if s['hy2_obfs'] else {}),
          # Shared servers: clients are told to use BBR instead of fixed-rate
          # Brutal, which would ignore the fair-share queue and starve others.
          'ignore_client_bandwidth': s['fair_share'],
@@ -319,11 +396,17 @@ def inbound_pair(s, k, users, port, suffix):
                  'key_path': '/etc/la-vpn/hy2.key'}}]
 
 
-def client_config(s, k, strict=False):
+def client_config(s, k, strict=False, extra=True):
+    """extra=False keeps only Hy2 + VLESS, for clients that cannot pin TUIC/AnyTLS certificates."""
     prefix = s['node_prefix']
     hy, vl = prefix + '-Hy2', prefix + '-VLESS'
+    tu, at = prefix + '-TUIC', prefix + '-AnyTLS'
+    # Failover order: fastest UDP first, then the most proven TCP, then the extras.
+    # Never DIRECT: when every node fails, traffic is refused rather than leaked.
+    nodes = [hy, vl] + ([tu] if extra and 'tuic' in s['extra_protocols'] else []) \
+        + ([at] if extra and 'anytls' in s['extra_protocols'] else [])
     auto, select = AUTO_GROUP, SELECT_GROUP
-    group = lambda name: {'name': name, 'type': 'fallback', 'proxies': [hy, vl],
+    group = lambda name: {'name': name, 'type': 'fallback', 'proxies': nodes,
                           'url': 'https://www.gstatic.com/generate_204', 'interval': 60,
                           'timeout': 5000, 'lazy': False, 'max-failed-times': 2, 'expected-status': 204}
     policies = routing.dns_policies()
@@ -368,18 +451,30 @@ def client_config(s, k, strict=False):
                  'servername': s['reality_server_name'], 'client-fingerprint': 'chrome',
                  'reality-opts': {'public-key': k['reality_public_key'], 'short-id': k['short_id']}},
                 {'name': hy, 'type': 'hysteria2', 'server': s['server_ip'], 'port': k.get('port', 443),
-                 'password': k['hy2_password'], 'obfs': 'salamander', 'obfs-password': k['obfs_password'],
+                 **({'ports': '{}-{}'.format(*k['hop']), 'hop-interval': 30} if s['port_hopping'] else {}),
+                 'password': k['hy2_password'],
+                 **({'obfs': 'salamander', 'obfs-password': k['obfs_password']} if s['hy2_obfs'] else {}),
                  'sni': s['hy2_server_name'], 'alpn': ['h3'], 'skip-cert-verify': True,
                  'fingerprint': k['certificate_fingerprint'],
                  **({} if s['fair_share'] else
-                    {'up': f"{int(s['hy2_up_mbps'])} Mbps", 'down': f"{int(s['hy2_down_mbps'])} Mbps"})}],
+                    {'up': f"{int(s['hy2_up_mbps'])} Mbps", 'down': f"{int(s['hy2_down_mbps'])} Mbps"})}]
+            # skip-cert-verify only disables CA checks: the pinned fingerprint
+            # still has to match, so a substituted certificate is refused.
+            + ([{'name': tu, 'type': 'tuic', 'server': s['server_ip'], 'port': k['alt'], 'uuid': k['uuid'],
+                 'password': k['hy2_password'], 'alpn': ['h3'], 'congestion-controller': 'bbr',
+                 'udp-relay-mode': 'native', 'reduce-rtt': False, 'udp': True, 'sni': s['hy2_server_name'],
+                 'skip-cert-verify': True, 'fingerprint': k['certificate_fingerprint']}] if tu in nodes else [])
+            + ([{'name': at, 'type': 'anytls', 'server': s['server_ip'], 'port': k['alt'],
+                 'password': k['hy2_password'], 'client-fingerprint': 'chrome', 'udp': True,
+                 'sni': s['hy2_server_name'], 'skip-cert-verify': True,
+                 'fingerprint': k['certificate_fingerprint']}] if at in nodes else []),
             'proxy-groups': [{'name': select, 'type': 'select',
-                              'proxies': [auto, hy, vl] + ([] if strict else ['DIRECT']),
+                              'proxies': [auto] + nodes + ([] if strict else ['DIRECT']),
                               'default-selected': auto}, group(auto),
-                             {'name': 'AI', 'type': 'select', 'proxies': [auto, hy, vl]},
-                             {'name': 'Claude', 'type': 'select', 'proxies': ['AI', hy, vl]},
-                             {'name': 'YouTube', 'type': 'select', 'proxies': [auto, hy, vl]},
-                             {'name': 'TikTok', 'type': 'select', 'proxies': [auto, hy, vl]}], 'rules': rules}
+                             {'name': 'AI', 'type': 'select', 'proxies': [auto] + nodes},
+                             {'name': 'Claude', 'type': 'select', 'proxies': ['AI'] + nodes},
+                             {'name': 'YouTube', 'type': 'select', 'proxies': [auto] + nodes},
+                             {'name': 'TikTok', 'type': 'select', 'proxies': [auto] + nodes}], 'rules': rules}
 
 
 def node_subscription(s, k):
@@ -388,8 +483,9 @@ def node_subscription(s, k):
     Hysteria2 URI bandwidth extensions are not portable. Clients importing this
     list may need to set up/down manually; the Clash YAML retains both targets.
     """
-    hy = urlencode({'sni': s['hy2_server_name'], 'insecure': '1', 'obfs': 'salamander',
-                    'obfs-password': k['obfs_password'], 'pinSHA256': k['certificate_fingerprint']})
+    hy = urlencode({'sni': s['hy2_server_name'], 'insecure': '1',
+                    **({'obfs': 'salamander', 'obfs-password': k['obfs_password']} if s['hy2_obfs'] else {}),
+                    'pinSHA256': k['certificate_fingerprint']})
     vl = urlencode({'encryption': 'none', 'security': 'reality', 'type': 'tcp',
                     'sni': s['reality_server_name'], 'fp': 'chrome',
                     'pbk': k['reality_public_key'], 'sid': k['short_id'], 'flow': 'xtls-rprx-vision'})
@@ -404,7 +500,8 @@ def shadowrocket_config(s, k, strict=False):
 
     No MITM/scripts, no broad subscription regex, no automatic DIRECT fallback.
     """
-    cfg = client_config(s, k, strict)
+    # Shadowrocket cannot pin TUIC/AnyTLS certificates, so it only gets the two pinned protocols.
+    cfg = client_config(s, k, strict, extra=False)
     hy = s['node_prefix'] + '-Hy2'
     # Pin DNS to this server's concrete nodes, never the app-wide current node.
     dns = 'https://1.1.1.1/dns-query#proxy=' + quote(hy, safe='')
@@ -636,6 +733,20 @@ def client_files(s, k):
             'shadowrocket-us.conf': shadowrocket_config(s, k, strict=True)}
 
 
+def hop_ruleset(s):
+    """nftables input for la-vpn-hop.service: redirect each URL's UDP hop block to
+    its Hy2 port. Disabled hopping still removes a table left by an earlier run.
+    Only gowest's own table is touched; it holds nothing but these redirects."""
+    text = 'table inet la_vpn_hop\ndelete table inet la_vpn_hop\n'
+    if not s['port_hopping']:
+        return text
+    rows = ''.join(f"        udp dport {x['hop'][0]}-{x['hop'][1]} redirect to :{x['main']}\n"
+                   for x in port_layout(s).values())
+    return text + ('table inet la_vpn_hop {\n    chain prerouting {\n'
+                   '        type nat hook prerouting priority dstnat; policy accept;\n'
+                   + rows + '    }\n}\n')
+
+
 def nginx_config(s, k):
     sub = s['subscription']
     tls = sub['scheme'] == 'https'
@@ -678,6 +789,14 @@ http {
             add_header Cache-Control "no-store" always;
         }}
 '''
+        # Line check from the client: a plain download measures the route
+        # itself, without any proxy in between. Behind the same private token.
+        text += f'''        location = /sub/{a['subscription_token']}-speedtest {{
+            alias /etc/la-vpn/speedtest.bin;
+            default_type application/octet-stream;
+            add_header Cache-Control "no-store" always;
+        }}
+'''
     return text + '        location / { return 404; }\n    }\n}\n'
 
 
@@ -713,6 +832,7 @@ def render(raw, directory):
     write(out / 'settings.json', dump(s))
     write(out / 'server.json', dump(server_config(s, k)))
     write(out / 'nginx.conf', nginx_config(s, k))
+    write(out / 'hop.nft', hop_ruleset(s))
     write(out / 'subinfo.conf', '# Populated by optional vnStat display timer.\n')
     for a in accounts(s, k):
         write_account(out / account_dir(a['name']), s, a)

@@ -24,7 +24,7 @@ import vpn
 def config(both=False):
     return launcher.build_settings('8.8.4.4', 10, 30, 'both' if both else 'http',
         host='sub.example.com' if both else '', cert='/root/fullchain.pem', key='/root/key.pem',
-        accept_http_risk=True)
+        accept_http_risk=True, extra_protocols=(), port_hopping=False)  # legacy port set under test
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -85,7 +85,7 @@ class DiscoveryTests(unittest.TestCase):
                 patch.object(launcher.platform,'system',return_value='Linux'), \
                 patch.object(launcher.os,'geteuid',return_value=0), \
                 patch.object(launcher.subprocess,'run'), patch.object(launcher,'dispatch') as dispatch, \
-                patch('builtins.input',side_effect=[str(Path(directory)/'params.json'),'','', '30Mbps', '', '',
+                patch('builtins.input',side_effect=[str(Path(directory)/'params.json'),'','', '30Mbps', '', '', '',
                     '1,2','sub.example.com','/root/fullchain.pem','/root/key.pem','HTTP','','INSTALL']):
             launcher.wizard()
             cfg=json.loads((Path(directory)/'params.json').read_text())
@@ -121,7 +121,7 @@ class MultiTransportTests(unittest.TestCase):
             nginx = (out/'nginx.conf').read_text()
             self.assertIn('listen 80;', nginx)
             self.assertIn('listen 8443 ssl;', nginx)
-            self.assertEqual(nginx.count('location = /sub/'), 5)
+            self.assertEqual(nginx.count('location = /sub/'), 6)  # five files + line-check download
             entries = json.loads((out/'transport-urls.json').read_text())
             self.assertEqual([urlsplit(x['base']).scheme for x in entries], ['https','http'])
             self.assertEqual(urlsplit(entries[0]['base']).path,urlsplit(entries[1]['base']).path)
