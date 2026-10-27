@@ -19,7 +19,7 @@ import routing
 
 DOMAINS = routing.CLAUDE
 PROJECT_NAME = 'gowest'
-KIT_VERSION = '0.5.9'
+KIT_VERSION = '0.6.0'
 SELECT_GROUP = '出口选择'
 AUTO_GROUP = '自动回退'
 # Tailscale control plane stays direct on every Mihomo client:

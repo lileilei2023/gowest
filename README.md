@@ -3,10 +3,10 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.5.9-6366f1">
+  <img alt="version" src="https://img.shields.io/badge/version-0.6.0-6366f1">
   <img alt="platform" src="https://img.shields.io/badge/server-Ubuntu%2024.04%20amd64%20%7C%20arm64-e95420">
   <img alt="sing-box" src="https://img.shields.io/badge/sing--box-1.14.3-0ea5e9">
-  <img alt="tests" src="https://img.shields.io/badge/tests-232%20passed-22c55e">
+  <img alt="tests" src="https://img.shields.io/badge/tests-242%20passed-22c55e">
   <img alt="clients" src="https://img.shields.io/badge/clients-macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-64748b">
 </p>
 
@@ -21,9 +21,9 @@
 
 ---
 
-**gowest** 在一台空白的 Ubuntu 24.04 服务器上，用一条命令部署 **Hysteria2 + VLESS REALITY** 双协议代理，并生成 macOS / Windows / Android / iOS 四端订阅。
+**gowest** 适合**几个人合租一台海外服务器**：在空白的 Ubuntu 24.04 上，用一条命令部署 **Hysteria2 + VLESS REALITY** 双协议代理，每人一个订阅链接，带宽公平分配，按月控制流量，四端订阅都已配好 AI / Claude 分流。一个人用也完全可以。
 
-- **一条命令**：中文向导，回答几个问题就装好；失败自动回滚。
+- **一条命令**：在自己电脑上运行，中文向导，几个问题就装好；失败自动回滚；升级也是一条命令。
 - **双线路互备**：Hy2 优先，故障时自动切到 VLESS，不会悄悄走直连。
 - **多人共用**：分成几份由你决定，每份一个订阅链接；忙时均分，闲时拉满。
 - **月流量配额**：填 `1TB` 或 `512GB`，订阅里显示用量，超额可自动暂停。
@@ -32,18 +32,26 @@
 
 **1. 准备服务器**：空白 Ubuntu 24.04，在云控制台的安全组放行 **TCP/UDP 443** 和 **TCP 80**（多人共用时端口不同，向导会列出）。
 
-**2. 在服务器上运行：**
+**2. 在你自己的电脑上运行**（会通过 SSH 把代码传到服务器并打开向导，服务器上不需要 git）：
 
 ```sh
 git clone https://github.com/lileilei2023/gowest.git && cd gowest
-sudo bash deploy.sh
+./remote.sh root@<服务器IP>
 ```
 
 **3. 导入客户端**：安装完成后屏幕上会显示订阅地址，也可以随时查看：
 
 ```sh
-sudo bash /opt/la-vpn/deploy.sh urls --client mac   # 或 windows / android / shadowrocket
+./remote.sh root@<服务器IP> urls --client mac   # 或 windows / android / shadowrocket
 ```
+
+**以后升级**：拉取最新代码后一条命令，密钥、端口和订阅地址都不变，客户端无需重新导入：
+
+```sh
+git pull && ./remote.sh root@<服务器IP> upgrade
+```
+
+Windows 电脑没有 `sh` 时，可以 SSH 登录服务器后在服务器上 `git clone`，再运行 `sudo bash deploy.sh`（升级用 `sudo bash deploy.sh upgrade --confirm-server <服务器IP>`）。
 
 客户端去哪下载，见 [客户端下载](#-客户端下载)。更多方式（非交互安装、本机预览配置、安全组模板）见 [快速部署](docs/快速部署.md)。
 
@@ -76,9 +84,9 @@ sudo bash /opt/la-vpn/deploy.sh urls --client mac   # 或 windows / android / sh
 装好之后也可以随时调整，立即生效，订阅地址不变：
 
 ```sh
-sudo bash /opt/la-vpn/deploy.sh bandwidth --set 200Mbps --confirm-server <服务器IP>
-sudo bash /opt/la-vpn/deploy.sh bandwidth --user bob --cap 20Mbps --confirm-server <服务器IP>
-sudo bash /opt/la-vpn/deploy.sh traffic --quota 1TB --on-exceed stop --confirm-server <服务器IP>
+./remote.sh root@<服务器IP> bandwidth --set 200Mbps
+./remote.sh root@<服务器IP> bandwidth --user bob --cap 20Mbps
+./remote.sh root@<服务器IP> traffic --quota 1TB --on-exceed stop
 ```
 
 只写数字时，流量按 GB、带宽按 Mbps 计算。实现原理和计量口径见 [详细说明](docs/详细说明.md)。
@@ -111,10 +119,12 @@ Mac / Windows 也可以直接运行 `clients/` 里的一键脚本，自动下载
 <summary><b>常用运维命令</b></summary>
 
 ```sh
-sudo python3 -B /opt/la-vpn/vpn.py status     # 运行状态、队列、本月流量
-sudo python3 -B /opt/la-vpn/vpn.py verify     # 本机验收
-sudo python3 -B /opt/la-vpn/vpn.py rollback   # 回滚（可恢复）
+./remote.sh root@<服务器IP> status     # 版本、运行状态、队列、本月流量
+./remote.sh root@<服务器IP> verify     # 本机验收
+./remote.sh root@<服务器IP> rollback   # 回滚（可恢复）
 ```
+
+在服务器上直接操作时，把 `./remote.sh root@<服务器IP>` 换成 `sudo bash /opt/la-vpn/deploy.sh`；改带宽、流量和升级还要加 `--confirm-server <服务器IP>`。
 
 </details>
 
@@ -123,8 +133,9 @@ sudo python3 -B /opt/la-vpn/vpn.py rollback   # 回滚（可恢复）
 
 ```text
 gowest/
+├── remote.sh                 # 在自己电脑上运行：上传、安装、升级、管理
 ├── deploy.sh / launcher.py   # 中文向导与统一入口
-├── vpn.py                    # plan / install / status / verify / urls / bandwidth / traffic / rollback
+├── vpn.py                    # plan / install / upgrade / status / verify / urls / bandwidth / traffic / rollback
 ├── render.py                 # 密钥、端口、Clash YAML、小火箭配置
 ├── network.py                # BBR / FQ 与按链接分配的 HTB 队列
 ├── subinfo.py                # 月流量统计、超额暂停与恢复

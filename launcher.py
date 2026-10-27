@@ -17,7 +17,8 @@ import autoconfig
 import kit_runtime
 
 ROOT = Path(__file__).resolve().parent
-MANAGEMENT = {'plan', 'install', 'status', 'verify', 'urls', 'rollback', 'repair-fq', 'bandwidth', 'traffic'}
+MANAGEMENT = {'plan', 'install', 'status', 'verify', 'urls', 'rollback', 'repair-fq', 'bandwidth', 'traffic',
+              'upgrade'}
 
 
 def build_settings(server_ip, up, down, mode, host='', cert='', key='', tailnet='',

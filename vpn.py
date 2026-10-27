@@ -26,7 +26,7 @@ import hostfirewall
 import kit_runtime
 from installlog import InstallLog, redact
 from render import (dump, render, settings, SUBSCRIPTION_FILES, account_dir, accounts, client_files, shape_mbps,
-                    proxy_ports, share_plan, format_gb,
+                    proxy_ports, share_plan, format_gb, server_config, nginx_config, write_account, KIT_VERSION,
                     android_guide_text, desktop_guide_text, shadowrocket_guide_text, subscription_endpoints)
 
 HERE = Path(__file__).resolve().parent
@@ -44,6 +44,9 @@ VERSION = '1.14.3'
 # Digests from the official SagerNet GitHub release asset metadata, audited 2026-10-25.
 RELEASES = {'x86_64': ('amd64', 'e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee'),
             'aarch64': ('arm64', '29dae24d76bea3bc62d07dd3e60cfc12003de7debbd6b768df9be9c68360174e')}
+PROGRAM_FILES = ('vpn.py', 'render.py', 'routing.py', 'network.py', 'subinfo.py', 'launcher.py',
+                 'deploy.sh', 'firewall.py', 'autoconfig.py', 'hostfirewall.py',
+                 'kit_runtime.py', 'installlog.py')
 SERVICES = ['la-vpn.service', 'la-vpn-subscription.service', 'la-vpn-fq.service',
             'la-vpn-subinfo.service', 'la-vpn-subinfo.timer']
 
@@ -274,7 +277,11 @@ def ensure_share_modules(s, log):
     return 'installed'
 
 
-def download_binary(destination):
+def download_binary(s):
+    managed_file(s, PROGRAM / 'bin/sing-box', fetch_binary(), 0o755)
+
+
+def fetch_binary():
     arch, expected = RELEASES[platform.machine()]
     name = f'sing-box-{VERSION}-linux-{arch}'
     url = f'https://github.com/SagerNet/sing-box/releases/download/v{VERSION}/{name}.tar.gz'
@@ -288,8 +295,7 @@ def download_binary(destination):
         if not member.isfile() or member.size > 200 * 1024 * 1024:
             raise RuntimeError('Unexpected executable archive member')
         # Never extract arbitrary archive paths or symlinks.
-        data = tf.extractfile(member).read()
-    managed_file(destination, PROGRAM / 'bin/sing-box', data, 0o755)
+        return tf.extractfile(member).read()
 
 
 def installed_command(*arguments):
@@ -298,14 +304,15 @@ def installed_command(*arguments):
     return ['/usr/bin/python3', '-B', str(PROGRAM / 'launcher.py'), *arguments]
 
 
-def install_program(s):
+def program_files():
     if kit_runtime.compiled():
-        managed_file(s, PROGRAM / 'gowest', kit_runtime.executable().read_bytes(), 0o755)
-    else:
-        for name in ('vpn.py', 'render.py', 'routing.py', 'network.py', 'subinfo.py', 'launcher.py',
-                     'deploy.sh', 'firewall.py', 'autoconfig.py', 'hostfirewall.py',
-                     'kit_runtime.py', 'installlog.py'):
-            managed_file(s, PROGRAM / name, (HERE / name).read_bytes(), 0o755)
+        return {PROGRAM / 'gowest': kit_runtime.executable().read_bytes()}
+    return {PROGRAM / name: (HERE / name).read_bytes() for name in PROGRAM_FILES}
+
+
+def install_program(s):
+    for target, data in program_files().items():
+        managed_file(s, target, data, 0o755)
 
 
 def service_files(dev):
@@ -487,7 +494,7 @@ def install(cfg, confirm, firewall_mode='auto'):
         raise
     os.umask(0o077)
     STATE.mkdir(mode=0o700)
-    s = {'status': 'installing', 'server_ip': cfg['server_ip'], 'files': {},
+    s = {'status': 'installing', 'server_ip': cfg['server_ip'], 'files': {}, 'kit_version': KIT_VERSION,
          'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
          'stock_nginx_masked': False}
     save_state(s)
@@ -741,6 +748,97 @@ def change_traffic(confirm, quota=None, metering=None, on_exceed=None):
                                 if cfg['traffic']['total_bytes'] else '不设置')}))
 
 
+def sing_box_version():
+    out = run([str(PROGRAM / 'bin/sing-box'), 'version'], check=False).stdout or ''
+    words = out.split()
+    return words[2] if len(words) > 2 and words[:2] == ['sing-box', 'version'] else ''
+
+
+def upgrade(confirm):
+    """Swap in this kit's code and re-render configs from the stored keys.
+
+    Keys, ports and subscription URLs stay the same. Every file is checked
+    against its recorded digest before anything changes, and a failed start
+    puts the previous files back."""
+    s, cfg = installed(confirm)
+    keys = json.loads((STATE / 'generated/secrets.json').read_text())
+    dev = json.loads((STATE / 'network.json').read_text())['interface']
+    targets = {path: (data, 0o755, None) for path, data in program_files().items()}
+    targets.update({UNITS / name: (text.encode(), 0o644, None) for name, text in service_files(dev).items()})
+    targets[CONFIG / 'settings.json'] = (dump(cfg).encode(), 0o600, None)
+    targets[CONFIG / 'server.json'] = (dump(server_config(cfg, keys)).encode(), 0o640, 'la-vpn')
+    targets[CONFIG / 'nginx.conf'] = (nginx_config(cfg, keys).encode(), 0o600, None)
+    for account in accounts(cfg, keys):
+        for name, body in client_files(cfg, account).items():
+            targets[served_dir(account['name']) / name] = (body.encode(), 0o640, 'www-data')
+    current = sing_box_version()
+    if current and current != VERSION:
+        targets[PROGRAM / 'bin/sing-box'] = (fetch_binary(), 0o755, None)
+    changed = {p: v for p, v in targets.items() if p.is_symlink() or not p.exists() or p.read_bytes() != v[0]}
+    for path in changed:
+        recorded = s['files'].get(str(path))
+        if recorded is None and (path.exists() or path.is_symlink()):
+            raise RuntimeError('File not owned by gowest; refusing upgrade: ' + str(path))
+        if recorded is not None and (path.is_symlink() or not path.exists() or sha(path) != recorded):
+            raise RuntimeError('Managed file changed externally; refusing upgrade: ' + str(path))
+    previous = s.get('kit_version', '0.5.9 或更早')
+    if not changed:
+        s['kit_version'] = KIT_VERSION
+        save_state(s)
+        print(f'已是最新：gowest {KIT_VERSION}，sing-box {current or VERSION}；没有文件需要更新。')
+        return
+    backup = {path: path.read_bytes() if path.exists() else None for path in changed}
+    names = {path.name for path in changed}
+    restart = []
+    if names & {'server.json', 'sing-box', 'la-vpn.service'}:
+        restart.append('la-vpn.service')
+    if names & {'nginx.conf', 'la-vpn-subscription.service'}:
+        restart.append('la-vpn-subscription.service')
+    try:
+        for path, (data, mode, group) in changed.items():
+            if str(path) in s['files']:
+                replace_managed(s, path, data, mode, group)
+            else:
+                managed_file(s, path, data, mode, group)
+        run(['systemctl', 'daemon-reload'])
+        run([str(PROGRAM / 'bin/sing-box'), 'check', '-c', str(CONFIG / 'server.json')])
+        run(['nginx', '-t', '-c', str(CONFIG / 'nginx.conf')])
+        if restart:
+            run(['systemctl', 'restart'] + restart, timeout=90)
+        verify_started(s)
+    except BaseException:
+        print('升级失败，正在恢复原来的文件……', file=sys.stderr)
+        for path, data in backup.items():
+            if data is None:
+                path.unlink(missing_ok=True)
+                s['files'].pop(str(path), None)
+            else:
+                tmp = path.with_name('.' + path.name + '.restore')
+                tmp.write_bytes(data)
+                shutil.copymode(path, tmp)
+                if changed[path][2]:
+                    os.chown(tmp, 0, grp.getgrnam(changed[path][2]).gr_gid)
+                os.replace(tmp, path)
+                s['files'][str(path)] = hashlib.sha256(data).hexdigest()
+        save_state(s)
+        run(['systemctl', 'daemon-reload'], check=False)
+        if restart:
+            run(['systemctl', 'restart'] + restart, check=False, timeout=90)
+        raise
+    # Refresh the private copies that urls reads; their content follows the new kit.
+    with tempfile.TemporaryDirectory(dir=STATE) as tmp:
+        for account in accounts(cfg, keys):
+            fresh = Path(tmp) / account_dir(account['name'])
+            write_account(fresh, cfg, account)
+            for item in fresh.iterdir():
+                os.replace(item, STATE / 'generated' / account_dir(account['name']) / item.name)
+    s['kit_version'] = KIT_VERSION
+    save_state(s)
+    print(f'已升级：gowest {previous} → {KIT_VERSION}，更新了 {len(changed)} 个文件'
+          + (f'，重启了 {"、".join(restart)}' if restart else '，无需重启代理') + '。')
+    print('密钥、端口和订阅地址都没有变；客户端下次更新订阅时会拿到新配置。')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -775,6 +873,8 @@ def main(argv=None):
     item.add_argument('--metering', choices=('both', 'outbound'))
     item.add_argument('--on-exceed', choices=('warn', 'stop'))
     item.add_argument('--confirm-server', required=True)
+    item = sub.add_parser('upgrade', help='用当前这份代码升级已安装的服务器；密钥和订阅地址不变')
+    item.add_argument('--confirm-server', required=True)
     item = sub.add_parser('rollback')
     item.add_argument('--automatic', action='store_true', help=argparse.SUPPRESS)
     item = sub.add_parser('verify')
@@ -788,7 +888,7 @@ def main(argv=None):
                                  + ['TCP ' + str(x['port']) for x in subscription_endpoints(cfg)],
                         'owned_roots': [str(CONFIG), str(PROGRAM), str(STATE)],
                         'network': network.PARAMETERS,
-                        'qdisc_policy': ('fair-share CAKE on an untouched default root; custom queues left alone'
+                        'qdisc_policy': ('per-URL HTB fair share on an untouched default root; custom queues left alone'
                                          if cfg['fair_share'] else 'replace only default pfifo_fast; leave custom queues'),
                         'users': cfg['users'] or ['(single)'], 'fair_share': cfg['fair_share'],
                         'fair_share_rate_mbps': shape_mbps(cfg) or None,
@@ -825,6 +925,10 @@ def main(argv=None):
             raise RuntimeError('请至少指定 --quota、--metering 或 --on-exceed')
         with exclusive_operation():
             change_traffic(args.confirm_server, args.quota, args.metering, args.on_exceed)
+    elif args.command == 'upgrade':
+        signal.signal(signal.SIGHUP, on_hangup)
+        with exclusive_operation():
+            upgrade(args.confirm_server)
     elif args.command == 'verify':
         state = load_state()
         verify(state)
@@ -833,7 +937,8 @@ def main(argv=None):
         print('Local verification passed; not an external client/throughput test.')
     elif args.command == 'status':
         s = load_state()
-        print(dump({k: s[k] for k in ('status', 'server_ip', 'created_at')}))
+        print(dump(dict({k: s[k] for k in ('status', 'server_ip', 'created_at')},
+                        kit_version=s.get('kit_version', '0.5.9 或更早'), sing_box=sing_box_version() or 'unknown')))
         for name in SERVICES:
             print(name + ': ' + run(['systemctl', 'is-active', name], check=False).stdout.strip())
         print(dump({'network': network.health(STATE / 'network.json')}))
