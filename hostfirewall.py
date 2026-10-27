@@ -39,7 +39,9 @@ def inspect_command(args):
 
 
 def required_ports(settings):
-    return [('tcp', 443), ('udp', 443)] + [('tcp', x['port']) for x in subscription_endpoints(settings)]
+    from render import proxy_ports
+    proxies = [(proto, port) for port in proxy_ports(settings) for proto in ('tcp', 'udp')]
+    return proxies + [('tcp', x['port']) for x in subscription_endpoints(settings)]
 
 
 def file_digests():

@@ -26,6 +26,7 @@ import hostfirewall
 import kit_runtime
 from installlog import InstallLog, redact
 from render import (dump, render, settings, SUBSCRIPTION_FILES, account_dir, accounts, client_files, shape_mbps,
+                    proxy_ports, share_plan,
                     android_guide_text, desktop_guide_text, shadowrocket_guide_text, subscription_endpoints)
 
 HERE = Path(__file__).resolve().parent
@@ -36,6 +37,8 @@ RUNTIME = Path('/var/lib/la-vpn')
 LOGS = Path('/var/log/la-vpn-subscription')
 ARCHIVES = Path('/var/lib/la-vpn-archives')
 SYSCTL = Path('/etc/sysctl.d/90-la-vpn.conf')
+# Added only when the kernel's extra-modules package has no APT candidate.
+KERNEL_SOURCE = Path('/etc/apt/sources.list.d/gowest-ubuntu-kernel.sources')
 UNITS = Path('/etc/systemd/system')
 VERSION = '1.14.3'
 # Digests from the official SagerNet GitHub release asset metadata, audited 2026-10-25.
@@ -190,7 +193,7 @@ def preflight(s, confirm):
         raise RuntimeError('Requires amd64/arm64 and a running systemd')
     if confirm != s['server_ip'] or not ipaddress.ip_address(confirm).is_global:
         raise RuntimeError('Confirm the NEW server public IPv4 with --confirm-new-server')
-    conflicts = [CONFIG, PROGRAM, STATE, SYSCTL, RUNTIME,
+    conflicts = [CONFIG, PROGRAM, STATE, SYSCTL, RUNTIME, KERNEL_SOURCE,
                  Path('/etc/sing-box'), Path('/usr/bin/sing-box'), Path('/usr/local/bin/sing-box'),
                  UNITS / 'nginx.service', Path('/etc/nginx'), LOGS]
     conflicts += [UNITS / name for name in SERVICES]
@@ -209,7 +212,8 @@ def preflight(s, confirm):
     if int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines()
                 if line.startswith('MemTotal:'))) < 500000:
         raise RuntimeError('At least 512 MiB RAM is required for this tuning profile')
-    for proto, ports in [('tcp', [443] + [x['port'] for x in subscription_endpoints(s)]), ('udp', [443])]:
+    for proto, ports in [('tcp', proxy_ports(s) + [x['port'] for x in subscription_endpoints(s)]),
+                         ('udp', proxy_ports(s))]:
         for port in ports:
             result = run(['ss', '-H', '-ln' + ('t' if proto == 'tcp' else 'u'), f'sport = :{port}'])
             if result.stdout.strip():
@@ -238,6 +242,36 @@ def preflight(s, confirm):
         if 'does match certificate' not in result.stdout or 'does NOT match' in result.stdout:
             raise RuntimeError('HTTPS certificate does not match the subscription host')
     return network.interface()
+
+
+def kernel_source_text():
+    archive = ('http://archive.ubuntu.com/ubuntu' if platform.machine() == 'x86_64'
+               else 'http://ports.ubuntu.com/ubuntu-ports')
+    return ('# Managed by gowest: official Ubuntu archive for this kernel\'s extra modules.\n'
+            f'Types: deb\nURIs: {archive}\nSuites: noble noble-updates noble-security\n'
+            'Components: main\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n')
+
+
+def ensure_share_modules(s, log):
+    """HTB/fq_codel/u32 are usually in linux-modules; some cloud kernels ship
+    them in linux-modules-extra. Install it, adding the official source if the
+    image has none, and otherwise continue without per-URL shaping."""
+    if not network.missing_modules():
+        return 'available'
+    package = 'linux-modules-extra-' + platform.release()
+    policy = run(['apt-cache', 'policy', package], check=False).stdout
+    if 'Candidate:' not in policy or 'Candidate: (none)' in policy:
+        log.emit('内核模块', '软件源中没有 ' + package + '，添加 Ubuntu 官方源后重试')
+        managed_file(s, KERNEL_SOURCE, kernel_source_text())
+        run(['apt-get', 'update'], timeout=300)
+    result = run(['apt-get', 'install', '-y', '--no-install-recommends', package], timeout=600, check=False)
+    missing = network.missing_modules()
+    if missing:
+        log.emit('待确认', '无法加载 ' + '、'.join(missing) + '（' + package + ' 安装'
+                 + ('失败' if result.returncode else '后仍缺失') + '）；将不启用按订阅链接的公平分配')
+        return 'unavailable'
+    log.emit('内核模块', '已安装 ' + package + '，公平分配所需模块可用')
+    return 'installed'
 
 
 def download_binary(destination):
@@ -374,9 +408,10 @@ def verify(s):
         run(['systemctl', 'is-active', '--quiet', name])
     run([str(PROGRAM / 'bin/sing-box'), 'check', '-c', str(CONFIG / 'server.json')])
     run(['nginx', '-t', '-c', str(CONFIG / 'nginx.conf')])
-    for proto in ('t', 'u'):
-        if not run(['ss', '-H', '-ln' + proto, 'sport = :443']).stdout.strip():
-            raise RuntimeError('Proxy listener missing')
+    for port in proxy_ports(cfg):
+        for proto in ('t', 'u'):
+            if not run(['ss', '-H', '-ln' + proto, f'sport = :{port}']).stdout.strip():
+                raise RuntimeError(f'Proxy listener missing on port {port}')
     for user in cfg['users'] or ['']:
         verify_account(cfg, user)
     # This is deliberately local validation, not a fabricated end-to-end throughput check.
@@ -475,6 +510,9 @@ def install(cfg, confirm, firewall_mode='auto'):
             if not kit_runtime.compiled():
                 packages.append('python3-yaml')
             run(['apt-get', 'install', '-y', '--no-install-recommends'] + packages, timeout=600)
+            if cfg['fair_share']:
+                s['share_modules'] = ensure_share_modules(s, log)
+                save_state(s)
             unmask_stock(s)
             run(['useradd', '--system', '--user-group', '--home-dir', '/var/lib/la-vpn',
                  '--no-create-home', '--shell', '/usr/sbin/nologin', 'la-vpn'])
@@ -506,7 +544,10 @@ def install(cfg, confirm, firewall_mode='auto'):
                     managed_file(s, CONFIG / name, Path(cfg['subscription'][key]).read_bytes(), 0o600)
             run([str(PROGRAM / 'bin/sing-box'), 'check', '-c', str(CONFIG / 'server.json')])
         with log.step(6, '应用保守网络配置并启动专属服务'):
-            net = network.apply(STATE / 'network.json', shape_mbps=shape_mbps(cfg))
+            net = network.apply(STATE / 'network.json', plan=share_plan(cfg))
+            result = net.get('shaping', {}).get('result', 'not-recorded')
+            if cfg['fair_share'] and result != 'applied':
+                log.emit('待确认', '按订阅链接的公平分配未启用：' + result + '；运行 status 查看')
             text = '# Managed by gowest; only explicit conservative parameters.\n'
             text += ''.join(k + ' = ' + v + '\n' for k, v in net['applied'].items())
             managed_file(s, SYSCTL, text)
@@ -534,7 +575,8 @@ def install(cfg, confirm, firewall_mode='auto'):
         log.emit('下一步', '分端说明：sudo ' + entry + ' urls --client mac|windows|android|shadowrocket')
         if s['host_firewall']['report']['status'] in ('manual-review', 'check-only-no-changes', 'ufw-overlap-needs-review'):
             log.emit('待处理', '本机防火墙尚需人工处理；不能视为公网部署完成。')
-        ports = '、'.join(['TCP 443', 'UDP 443'] + ['TCP ' + str(x['port']) for x in subscription_endpoints(cfg)])
+        ports = '、'.join([f'{p} {n}' for n in proxy_ports(cfg) for p in ('TCP', 'UDP')]
+                         + ['TCP ' + str(x['port']) for x in subscription_endpoints(cfg)])
         log.emit('待处理', '云安全组未验证：请确认 ' + ports + '；再由外部客户端验收。')
     except BaseException:
         log.emit('回滚开始', '安装未完成；尝试回滚受管改动，保留已安装依赖。')
@@ -582,7 +624,7 @@ def rollback(automatic=False):
     archives.mkdir(mode=0o700, exist_ok=True)
     os.chmod(archives, 0o700)
     archive = Path(tempfile.mkdtemp(prefix='rollback-', dir=archives))
-    for path in [SYSCTL] + [UNITS / name for name in SERVICES]:
+    for path in [SYSCTL, KERNEL_SOURCE] + [UNITS / name for name in SERVICES]:
         if str(path) in s['files'] and path.exists():
             path.rename(archive / path.name)
     run(['systemctl', 'stop', 'la-vpn-guard.timer'], check=False)
@@ -635,20 +677,32 @@ def installed(confirm):
     return s, settings(json.loads(path.read_text()))
 
 
-def change_bandwidth(text, confirm):
-    """Re-target the plan bandwidth without touching keys or subscription URLs."""
+def change_bandwidth(text, confirm, user='', cap=None):
+    """Re-target the plan bandwidth or one URL's cap; keys and URLs stay the same."""
     import launcher
     s, cfg = installed(confirm)
-    mbps = launcher.whole_mbps(text, '带宽')
-    cfg['hy2_up_mbps'] = cfg['hy2_down_mbps'] = mbps
+    if user:
+        if user not in cfg['users']:
+            raise RuntimeError('没有这个订阅用户：' + user)
+        if cap in ('none', '0'):
+            cfg['user_caps'].pop(user, None)
+        else:
+            cfg['user_caps'][user] = launcher.whole_mbps(cap, '上限')
+    else:
+        mbps = launcher.whole_mbps(text, '带宽')
+        cfg['hy2_up_mbps'] = cfg['hy2_down_mbps'] = mbps
     cfg = settings(cfg)
     if cfg['fair_share']:
-        # BBR clients carry no bandwidth, so only the shared queue rate changes.
+        # BBR clients carry no bandwidth, so only the share tree changes.
+        plan = share_plan(cfg)
         if network.health(STATE / 'network.json')['fair_share']['result'] == 'applied':
-            network.set_rate(STATE / 'network.json', shape_mbps(cfg))
-            print(f'公平分配队列速率已改为 {shape_mbps(cfg)} Mbps（带宽的 95%），无需刷新订阅。')
+            network.set_plan(STATE / 'network.json', plan)
+            print(dump({'fair_share_plan': plan}), end='')
+            print('已即时生效：每个订阅链接保底 总速率/人数，空闲时可借用到各自上限；无需刷新订阅。')
         else:
-            print('公平分配队列未生效，只更新记录的带宽；运行 status 查看原因。')
+            print('公平分配未生效，只更新记录的参数；运行 status 查看原因。')
+    elif user:
+        raise RuntimeError('单人模式没有按链接的上限')
     else:
         # Single user with Brutal: the Hy2 targets live inside client profiles.
         keys = json.loads((STATE / 'generated/secrets.json').read_text())
@@ -698,8 +752,11 @@ def main(argv=None):
                       help='clash = raw subscription links; mac/windows = Clash Verge Rev; '
                            'android = Clash Meta for Android; shadowrocket = iOS')
     item.add_argument('--user', default='', help='多人共用时指定用户名')
-    item = sub.add_parser('bandwidth', help='调整套餐带宽；多人模式即时改公平队列速率')
-    item.add_argument('--set', required=True, help='如 30Mbps、1Gbps')
+    item = sub.add_parser('bandwidth', help='调整套餐带宽，或某个订阅链接的上限；多人模式即时生效')
+    target = item.add_mutually_exclusive_group(required=True)
+    target.add_argument('--set', help='总带宽，如 30Mbps、1Gbps')
+    target.add_argument('--user', help='多人模式：要调整上限的订阅用户')
+    item.add_argument('--cap', help='与 --user 一起用：该链接最高速率，如 20Mbps；none 表示不限（可用满总带宽）')
     item.add_argument('--confirm-server', required=True)
     item = sub.add_parser('traffic', help='调整每月流量上限、计量方式和超额动作')
     item.add_argument('--quota', help='如 512GB、1TB；0 表示不设置')
@@ -715,7 +772,8 @@ def main(argv=None):
         if args.command == 'plan':
             print(dump({'operation': 'PLAN ONLY — no changes', 'target': cfg['server_ip'],
                         'supported_os': 'Ubuntu 24.04 amd64/arm64 with systemd', 'sing_box_version': VERSION,
-                        'ports': ['TCP 443', 'UDP 443'] + ['TCP ' + str(x['port']) for x in subscription_endpoints(cfg)],
+                        'ports': [f'{p} {n}' for n in proxy_ports(cfg) for p in ('TCP', 'UDP')]
+                                 + ['TCP ' + str(x['port']) for x in subscription_endpoints(cfg)],
                         'owned_roots': [str(CONFIG), str(PROGRAM), str(STATE)],
                         'network': network.PARAMETERS,
                         'qdisc_policy': ('fair-share CAKE on an untouched default root; custom queues left alone'
@@ -747,7 +805,9 @@ def main(argv=None):
             print(dump(network.verify_health(STATE / 'network.json')))
     elif args.command == 'bandwidth':
         with exclusive_operation():
-            change_bandwidth(args.set, args.confirm_server)
+            if bool(args.user) != bool(args.cap):
+                raise RuntimeError('--user 和 --cap 需要一起使用')
+            change_bandwidth(args.set, args.confirm_server, args.user or '', args.cap)
     elif args.command == 'traffic':
         if args.quota is None and not args.metering and not args.on_exceed:
             raise RuntimeError('请至少指定 --quota、--metering 或 --on-exceed')

@@ -21,7 +21,8 @@ def check(directory, sing_box=None, mihomo=None, geodata=None):
     server = json.loads((src / 'server.json').read_text())
     users = json.loads((src / 'users.json').read_text()) if (src / 'users.json').is_file() else ['']
     fair = server['inbounds'][1]['ignore_client_bandwidth']
-    assert len(server['inbounds'][0]['users']) == len(server['inbounds'][1]['users']) == len(users)
+    assert len(server['inbounds']) == 2 * len(users), 'Expected one VLESS + Hy2 pair per user'
+    assert len({i['listen_port'] for i in server['inbounds']}) == len(users), 'Each user needs its own port'
     folders = []
     for index, name in enumerate(users):
         folder = src / render.account_dir(name)
@@ -33,8 +34,10 @@ def check(directory, sing_box=None, mihomo=None, geodata=None):
         root = Path(tmp)
         os.chmod(root, 0o700)
         if sing_box:
-            server['inbounds'][1]['tls']['certificate_path'] = str(src / 'hy2.crt')
-            server['inbounds'][1]['tls']['key_path'] = str(src / 'hy2.key')
+            for inbound in server['inbounds']:
+                if inbound['type'] == 'hysteria2':
+                    inbound['tls']['certificate_path'] = str(src / 'hy2.crt')
+                    inbound['tls']['key_path'] = str(src / 'hy2.key')
             candidate = root / 'server.json'
             candidate.write_text(json.dumps(server))
             p = subprocess.run([str(Path(sing_box).resolve()), 'check', '-c', str(candidate)],
@@ -65,10 +68,15 @@ def check_account(src, folder, server, index, name, fair):
     hy = next(p for p in normal['proxies'] if p['type'] == 'hysteria2')
     vl = next(p for p in normal['proxies'] if p['type'] == 'vless')
     assert normal['proxies'] == strict['proxies'], 'Node mismatch'
-    assert hy['password'] == server['inbounds'][1]['users'][index]['password']
-    assert hy['obfs-password'] == server['inbounds'][1]['obfs']['password']
-    assert vl['uuid'] == server['inbounds'][0]['users'][index]['uuid']
-    assert server['inbounds'][1]['users'][index].get('name', '') == name
+    suffix = '-' + name if name else ''
+    vin = next(i for i in server['inbounds'] if i['tag'] == 'vless-in' + suffix)
+    hin = next(i for i in server['inbounds'] if i['tag'] == 'hy2-in' + suffix)
+    assert len(vin['users']) == len(hin['users']) == 1, 'One credential per inbound pair'
+    assert hy['password'] == hin['users'][0]['password']
+    assert hy['obfs-password'] == hin['obfs']['password']
+    assert vl['uuid'] == vin['users'][0]['uuid']
+    assert hin['users'][0].get('name', '') == name
+    assert hy['port'] == vl['port'] == hin['listen_port'] == vin['listen_port'], 'Client port must match its inbound'
     if fair:
         # Shared server: no client Brutal targets, the server commands BBR.
         assert 'up' not in hy and 'down' not in hy, 'Fair-share clients must not carry Brutal bandwidth'
@@ -81,6 +89,7 @@ def check_account(src, folder, server, index, name, fair):
     hy_uri, vl_uri = map(urlsplit, uris)
     assert hy_uri.scheme == 'hysteria2' and vl_uri.scheme == 'vless'
     assert hy_uri.hostname == hy['server'] and vl_uri.hostname == vl['server']
+    assert hy_uri.port == vl_uri.port == hy['port'], 'Native URI port must match the profile'
     assert unquote(hy_uri.username) == hy['password'] and vl_uri.username == vl['uuid']
     assert parse_qs(hy_uri.query)['obfs-password'] == [hy['obfs-password']]
     assert parse_qs(hy_uri.query)['pinSHA256'] == [hy['fingerprint']]

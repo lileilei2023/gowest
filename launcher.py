@@ -22,7 +22,7 @@ MANAGEMENT = {'plan', 'install', 'status', 'verify', 'urls', 'rollback', 'repair
 
 def build_settings(server_ip, up, down, mode, host='', cert='', key='', tailnet='',
                    accept_http_risk=False, subscription_port=None, node_prefix='LA', http_port=80,
-                   users=(), quota='', metering='both', on_exceed='warn'):
+                   users=(), quota='', metering='both', on_exceed='warn', user_caps=None):
     ip = ipaddress.IPv4Address(server_ip)
     if not ip.is_global:
         raise ValueError('请填写新服务器的真实公网 IPv4，不要使用示例/内网地址。')
@@ -45,24 +45,33 @@ def build_settings(server_ip, up, down, mode, host='', cert='', key='', tailnet=
     return render.settings({'server_ip': str(ip), 'hy2_up_mbps': up, 'hy2_down_mbps': down,
                             'node_prefix': node_prefix, 'ipv6': True, 'tailnet': tailnet,
                             'hosts': {}, 'subscription': subscription, 'users': list(users),
+                            'user_caps': dict(user_caps or {}),
                             'traffic': {'total_bytes': render.parse_bytes(quota), 'expire_epoch': 0,
                                         'metering': metering, 'on_exceed': on_exceed}})
 
 
 def parse_users(text):
-    """'' or '1' -> single user; '3' -> user1..user3; 'alice,bob' -> those names."""
-    value = str(text or '').strip().replace('，', ',').replace(' ', '')
+    """Shares chosen by the operator, one subscription URL each.
+
+    '' or '1' -> single; '3' -> user1..user3; 'alice,bob:20Mbps' -> names with an
+    optional per-URL cap. Returns (names, caps)."""
+    value = str(text or '').strip().replace('，', ',').replace('：', ':').replace(' ', '')
     if value in ('', '1'):
-        return []
+        return [], {}
     if value.isdigit():
         count = int(value)
         if not 2 <= count <= render.MAX_USERS:
-            raise ValueError(f'共用人数需在 1-{render.MAX_USERS} 之间')
-        return [f'user{i}' for i in range(1, count + 1)]
-    names = [x.lower() for x in value.split(',') if x]
+            raise ValueError(f'共用份数需在 1-{render.MAX_USERS} 之间')
+        return [f'user{i}' for i in range(1, count + 1)], {}
+    names, caps = [], {}
+    for item in filter(None, value.split(',')):
+        name, _, cap = item.partition(':')
+        names.append(name.lower())
+        if cap:
+            caps[name.lower()] = whole_mbps(cap, name + ' 的上限')
     if len(names) == 1:
-        raise ValueError('只有一人时直接回车即可；多人请输入人数或至少两个名字')
-    return names
+        raise ValueError('只有一份时直接回车即可；多份请输入份数或至少两个名字')
+    return names, caps
 
 
 def save_settings(config, output):
@@ -141,9 +150,9 @@ def wizard():
             address = prompt('新服务器公网 IPv4')
         prefix = prompt('服务器标签（仅区分节点，例如 LA、DC；各机代理组名称一致）', 'LA')
         up, down = prompt_bandwidth()
-        users = parse_users(prompt('共用人数或名字（回车 = 1 人；如 3 或 alice,bob,carol）'))
+        users, caps = parse_users(prompt('共用份数或名字（回车 = 1 份；如 3 或 alice,bob:20Mbps,carol）'))
         if users:
-            print(f'{len(users)} 人各自独立凭据和订阅；忙时按设备公平分配带宽，闲时一人可用满。')
+            print(f'{len(users)} 份，每份一个订阅链接和独立端口；忙时按链接均分，闲时可借满（或到该链接上限）。')
         quota = prompt('每月流量上限（如 1TB、512GB；回车 = 不设置）')
         on_exceed = 'warn'
         if render.parse_bytes(quota):
@@ -162,7 +171,8 @@ def wizard():
         accepted = mode == 'https' or prompt('确认 HTTP 会明文传输同一套节点凭据，请输入 HTTP', '') == 'HTTP'
         tailnet = prompt('可选：自己的 xxx.ts.net 域名，留空跳过')
         config = build_settings(address, up, down, mode, host, cert, key, tailnet, accepted,
-                                node_prefix=prefix, users=users, quota=quota, on_exceed=on_exceed)
+                                node_prefix=prefix, users=users, quota=quota, on_exceed=on_exceed,
+                                user_caps=caps)
         save_settings(config, output)
     subprocess.run(kit_runtime.command(['plan', '--settings', str(output)]), check=True)
     if platform.system() != 'Linux' or os.geteuid() != 0:
@@ -171,7 +181,8 @@ def wizard():
         print('sudo ' + entry + ' install --settings <参数文件路径> --confirm-new-server ' + config['server_ip'])
         return
     print('安装会检查本机防火墙并尝试安全新增 UFW 规则；不清空规则、不改变 SSH、不自动启停防火墙。')
-    print('云安全组需要云平台授权；当前无法自动验证，必须检查 TCP/UDP 443 和所选订阅端口。')
+    ports = '、'.join(str(p) for p in render.proxy_ports(config))
+    print('云安全组需要云平台授权；当前无法自动验证，必须检查 TCP/UDP ' + ports + ' 和所选订阅端口。')
     confirmation = prompt('当前目标公网 IPv4 为 ' + config['server_ip'] + '；输入 INSTALL 开始安装，留空取消')
     if confirmation != 'INSTALL':
         print('未确认安装，服务器配置未改变。')
@@ -228,7 +239,7 @@ def main(argv=None):
     init.add_argument('--certificate', default='')
     init.add_argument('--private-key', default='')
     init.add_argument('--tailnet', default='')
-    init.add_argument('--users', default='', help='多人共用：人数（如 3）或名字（alice,bob）；默认 1 人')
+    init.add_argument('--users', default='', help='共用份数（如 3）或名字，可带上限（alice,bob:20Mbps）；默认 1 份')
     init.add_argument('--monthly-quota', default='', help='每月流量上限，如 1TB、512GB；默认不设置')
     init.add_argument('--metering', choices=('both', 'outbound'), default='both',
                       help='云套餐计量方式：both = 进+出（默认，偏保守）；outbound = 只计出方向')
@@ -251,11 +262,12 @@ def main(argv=None):
     mode = 'both' if a.both else ('https' if a.https else 'http')
     if mode != 'https' and not a.accept_http_risk:
         parser.error('默认 HTTP 会明文传输节点凭据；需 --accept-http-risk，或显式选择 --https')
+    names, caps = parse_users(a.users)
     address = a.server_ip or autoconfig.detect_public_ipv4()['address']
     config = build_settings(address, up, down, mode,
                             a.subscription_host, a.certificate, a.private_key, a.tailnet,
                             a.accept_http_risk, a.subscription_port, a.node_prefix, a.http_port,
-                            parse_users(a.users), a.monthly_quota, a.metering, a.on_exceed)
+                            names, a.monthly_quota, a.metering, a.on_exceed, caps)
     save_settings(config, a.output)
 
 

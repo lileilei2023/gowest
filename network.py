@@ -9,9 +9,11 @@ import tempfile
 PRIOMAP = [1, 2, 2, 2, 1, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1]
 FQ_HANDLE = '1af0:'
 RESTORED_HANDLE = '1af1:'
-CAKE_HANDLE = '1af2:'
+SHARE_HANDLE = '1af2:'
+SHARE_MODULES = ('sch_htb', 'sch_fq_codel', 'cls_u32')
+QUANTUM = '70000'  # > 64 KiB GSO; HTB accepts up to 200000
 # Kernel-created defaults only (handle 0:). Deleting such a root lets the kernel
-# recreate exactly this default, which is what makes CAKE removal reversible.
+# recreate exactly this default, which is what makes the share tree reversible.
 DEFAULT_ROOTS = {'pfifo_fast', 'fq_codel', 'fq', 'mq', 'noqueue'}
 DEFAULT_CHILDREN = {'pfifo_fast', 'fq_codel', 'fq'}
 STATE_PATH = Path('/var/lib/la-vpn-deploy/network.json')
@@ -62,7 +64,7 @@ def topology(dev):
     try:
         classes = json.loads(run('tc', '-j', 'class', 'show', 'dev', dev) or '[]')
     except ValueError:
-        # iproute2 emits malformed JSON for CAKE's per-flow classes under load;
+        # iproute2 prints plain text (HTB) or malformed JSON (CAKE) for classes;
         # unknown classes are treated as present, never as an isolated root.
         classes = [{'unparsed': True}]
     filters = json.loads(run('tc', '-j', 'filter', 'show', 'dev', dev, 'root') or '[]')
@@ -128,62 +130,121 @@ def pristine(dev):
     return roots[0]
 
 
-def cake(dev, mbps, verb='replace'):
-    # dual-dsthost: share first per destination host (each client device on the
-    # download path), then per flow; idle capacity is always borrowed.
-    run('tc', 'qdisc', verb, 'dev', dev, 'root', 'handle', CAKE_HANDLE,
-        'cake', 'bandwidth', f'{int(mbps)}mbit', 'dual-dsthost')
+def missing_modules():
+    """Kernel modules the share tree needs; modprobe is a no-op when built in."""
+    def loads(module):
+        try:
+            return subprocess.run(['modprobe', module], capture_output=True, timeout=30).returncode == 0
+        except OSError:
+            return False  # No modprobe at all: treat as unavailable, never guess.
+    return [m for m in SHARE_MODULES if not loads(m)]
 
 
-def owned_cake(q, shaping):
-    return (q.get('kind') == 'cake' and q.get('handle') == CAKE_HANDLE
-            and identity(q) == identity(shaping.get('cake') or {}))
+def share_classes(plan):
+    """classid -> (rate kbit, ceil kbit, leaf handle, port or None).
+
+    Each subscription URL is one share: guaranteed total/N, may borrow up to its
+    cap (default: the whole rate) while others are idle. A small default class
+    carries everything else (SSH, subscription downloads, relayed uploads)."""
+    total = plan['rate_mbps'] * 1000
+    spare = max(1000, total // 50)
+    each = (total - spare) // len(plan['users'])
+    classes = {'1af2:1': (total, total, None, None), '1af2:ff': (spare, total, '1bff:', None)}
+    for i, user in enumerate(plan['users'], 1):
+        minor = format(0x10 + i, 'x')
+        classes['1af2:' + minor] = (each, min(user['cap_mbps'] * 1000, total),
+                                    format(0x1b00 + 0x10 + i, 'x') + ':', user['port'])
+    return classes
 
 
-def shape(state_path, state, mbps):
-    """Fair-share CAKE on a pristine default root; otherwise leave it and report."""
+def build_tree(dev, plan, verb='add'):
+    classes = share_classes(plan)
+    if verb == 'add':
+        run('tc', 'qdisc', 'replace', 'dev', dev, 'root', 'handle', SHARE_HANDLE, 'htb', 'default', 'ff')
+    for classid, (rate, ceil, leaf, port) in classes.items():
+        parent = SHARE_HANDLE if classid == '1af2:1' else '1af2:1'
+        # HTB's round robin adds one quantum per turn yet always sends a whole
+        # packet; with TSO/GSO packets up to 64 KiB a small quantum turns it into
+        # per-packet fairness (measured: 4 TCP flows got 35 vs 1 flow's 55 Mbps).
+        # A quantum above the largest GSO packet keeps the shares byte-fair.
+        run('tc', 'class', verb, 'dev', dev, 'parent', parent, 'classid', classid, 'htb',
+            'rate', f'{rate}kbit', 'ceil', f'{ceil}kbit', 'quantum', QUANTUM)
+        if verb != 'add':
+            continue
+        if leaf:
+            # fq_codel inside each share keeps one user's flows from queueing behind each other.
+            run('tc', 'qdisc', 'add', 'dev', dev, 'parent', classid, 'handle', leaf, 'fq_codel')
+        if port:
+            for proto, prio, match in (('ip', '1', 'ip'), ('ipv6', '2', 'ip6')):
+                run('tc', 'filter', 'add', 'dev', dev, 'parent', SHARE_HANDLE, 'protocol', proto,
+                    'prio', prio, 'u32', 'match', match, 'sport', str(port), '0xffff', 'flowid', classid)
+
+
+def to_kbit(text):
+    number, unit = re.fullmatch(r'([0-9.]+)([KMG]?)bit', text).groups()
+    return float(number) * {'': 0.001, 'K': 1, 'M': 1000, 'G': 1000000}[unit]
+
+
+def owned_tree(dev, shaping):
+    """Root, every class rate/ceil and every port filter match the stored plan."""
+    plan = shaping.get('plan')
+    q = root_qdisc(dev)
+    if not plan or q.get('kind') != 'htb' or q.get('handle') != SHARE_HANDLE:
+        return False
+    actual = {}
+    for line in run('tc', 'class', 'show', 'dev', dev).splitlines():
+        m = re.match(r'class htb (\S+) .*?rate (\S+) ceil (\S+)', line)
+        if m:
+            actual[m.group(1)] = (to_kbit(m.group(2)), to_kbit(m.group(3)))
+    expected = share_classes(plan)
+    if set(actual) != set(expected):
+        return False
+    close = lambda a, b: abs(a - b) <= max(2, b * 0.02)  # tc prints rounded units
+    if not all(close(actual[c][0], expected[c][0]) and close(actual[c][1], expected[c][1]) for c in expected):
+        return False
+    filters = json.loads(run('tc', '-j', 'filter', 'show', 'dev', dev, 'parent', SHARE_HANDLE) or '[]')
+    flows = sorted(f['options']['flowid'] for f in filters if f.get('options', {}).get('flowid'))
+    return flows == sorted(c for c, v in expected.items() if v[3] for _ in range(2))
+
+
+def shape(state_path, state, plan):
+    """Per-URL share tree on a pristine default root; otherwise leave it and report."""
     dev = state['interface']
     root = pristine(dev)
-    state['shaping'] = {'rate_mbps': int(mbps), 'cake': None, 'boot_id': boot_id()}
+    state['shaping'] = {'plan': plan, 'boot_id': boot_id()}
     if root is None:
         state['shaping']['result'] = 'skipped-custom-queue'
         save(state_path, state)
         return False
-    run('modprobe', 'sch_cake', check=False)
-    state['shaping'].update(before=identity(root), result='applying')
-    save(state_path, state)
-    try:
-        cake(dev, mbps)
-    except RuntimeError:
-        # Kernel without sch_cake: the root is untouched, fall back to FQ rules.
-        if pristine(dev) is None:
-            raise RuntimeError('CAKE failed and the root queue changed; manual review required')
-        state['shaping']['result'] = 'cake-unavailable'
+    if missing_modules():
+        state['shaping']['result'] = 'modules-unavailable'
         save(state_path, state)
         return False
-    q = root_qdisc(dev)
-    if q.get('kind') != 'cake' or q.get('handle') != CAKE_HANDLE:
-        raise RuntimeError('CAKE did not take effect; snapshot retained for recovery')
-    state['shaping'].update(cake=q, result='applied')
-    state['qdisc_result'] = 'cake-fair-share'
+    state['shaping'].update(before=identity(root), result='applying')
+    save(state_path, state)
+    build_tree(dev, plan)
+    if not owned_tree(dev, state['shaping']):
+        raise RuntimeError('Share tree did not take effect; snapshot retained for recovery')
+    state['shaping']['result'] = 'applied'
+    state['qdisc_result'] = 'per-url-fair-share'
     save(state_path, state)
     return True
 
 
-def set_rate(state_path, mbps):
-    """Change the fair-share rate in place; the queue and its flows are kept."""
+def set_plan(state_path, plan):
+    """Change the total rate or a share's cap in place; flows are kept."""
     state = json.loads(Path(state_path).read_text())
     shaping = state.get('shaping') or {}
     if shaping.get('result') != 'applied':
-        raise RuntimeError('Fair-share CAKE is not active on this server')
-    q = root_qdisc(state['interface'])
-    if not owned_cake(q, shaping):
-        raise RuntimeError('Managed CAKE changed outside this installer; refusing rate change')
-    cake(state['interface'], mbps, 'change')
-    q = root_qdisc(state['interface'])
-    if q.get('kind') != 'cake' or q.get('handle') != CAKE_HANDLE:
-        raise RuntimeError('CAKE rate change verification failed')
-    shaping.update(rate_mbps=int(mbps), cake=q)
+        raise RuntimeError('Per-URL fair share is not active on this server')
+    if not owned_tree(state['interface'], shaping):
+        raise RuntimeError('Managed share tree changed outside this installer; refusing change')
+    if [u['port'] for u in plan['users']] != [u['port'] for u in shaping['plan']['users']]:
+        raise RuntimeError('Users/ports differ from the installed tree; rate/cap changes only')
+    build_tree(state['interface'], plan, 'change')
+    if not owned_tree(state['interface'], dict(shaping, plan=plan)):
+        raise RuntimeError('Share tree change verification failed')
+    shaping['plan'] = plan
     save(state_path, state)
     return state
 
@@ -206,7 +267,7 @@ def set_fq(state_path, state, before):
     return state
 
 
-def apply(state_path, shape_mbps=0):
+def apply(state_path, plan=None):
     if Path(state_path).exists():
         raise RuntimeError('Network snapshot already exists; refusing repeat tuning')
     dev = interface()
@@ -230,7 +291,7 @@ def apply(state_path, shape_mbps=0):
         state['applied'][key] = value
         save(state_path, state)
         run('sysctl', '-w', key + '=' + value)
-    if shape_mbps and shape(state_path, state, shape_mbps):
+    if plan and shape(state_path, state, plan):
         return state
     if layout['isolated'] and safe_pfifofast(q, allow_nonzero=approved):
         set_fq(state_path, state, q)
@@ -245,8 +306,8 @@ def check_restore(state):
     shaping = state.get('shaping') or {}
     if shaping.get('result') in ('applied', 'applying'):
         q = root_qdisc(state['interface'])
-        ours = owned_cake(q, shaping) or (shaping['result'] == 'applying'
-                                          and q.get('kind') == 'cake' and q.get('handle') == CAKE_HANDLE)
+        ours = owned_tree(state['interface'], shaping) or (
+            shaping['result'] == 'applying' and q.get('kind') == 'htb' and q.get('handle') == SHARE_HANDLE)
         if not ours and pristine(state['interface']) is None:
             raise RuntimeError('Fair-share queue changed outside installer; manual review required')
     if state['qdisc_changed']:
@@ -277,10 +338,11 @@ def restore(state_path):
         # Sysctls (default_qdisc) are restored first, so deleting the managed root
         # lets the kernel recreate the original default queue.
         q = root_qdisc(state['interface'])
-        if q.get('kind') == 'cake' and q.get('handle') == CAKE_HANDLE:
+        if q.get('kind') == 'htb' and q.get('handle') == SHARE_HANDLE:
+            # Deleting the root removes every class, leaf and filter of the tree.
             run('tc', 'qdisc', 'del', 'dev', state['interface'], 'root')
         if pristine(state['interface']) is None:
-            raise RuntimeError('Default queue was not restored after removing CAKE')
+            raise RuntimeError('Default queue was not restored after removing the share tree')
         shaping['result'] = 'restored'
         save(state_path, state)
     if state['qdisc_changed']:
@@ -307,7 +369,7 @@ def repair_fq(state_path, adopt_default_fifo=False):
     """Explicit repair of a skipped legacy FIFO; no sysctls/subscriptions changed."""
     state = json.loads(Path(state_path).read_text())
     if (state.get('shaping') or {}).get('result') == 'applied':
-        raise RuntimeError('Fair-share CAKE manages this queue; FQ repair does not apply')
+        raise RuntimeError('Per-URL fair share manages this queue; FQ repair does not apply')
     layout = topology(state['interface'])
     q = layout['root']
     if state.get('qdisc_changed'):
@@ -330,14 +392,12 @@ def boot_fq(dev, state_path=STATE_PATH):
         raise RuntimeError('Interface does not match network snapshot')
     shaping = state.get('shaping') or {}
     if shaping.get('result') == 'applied':
-        q = root_qdisc(dev)
         # A reboot drops tc state; reapply only onto an untouched default root.
-        if not owned_cake(q, shaping) and pristine(dev) is not None:
-            cake(dev, shaping['rate_mbps'])
-            q = root_qdisc(dev)
-            if q.get('kind') == 'cake' and q.get('handle') == CAKE_HANDLE:
-                shaping.update(cake=q, boot_id=boot_id())
-                save(state_path, state)
+        # A kernel update without the modules keeps the default queue (reported).
+        if not owned_tree(dev, shaping) and pristine(dev) is not None and not missing_modules():
+            build_tree(dev, shaping['plan'])
+            shaping['boot_id'] = boot_id()
+            save(state_path, state)
         return health(state_path)
     layout = topology(dev)
     q = layout['root']
@@ -369,13 +429,14 @@ def health(state_path):
     fq = q.get('kind') == 'fq'
     shaping = state.get('shaping') or {}
     shaped = shaping.get('result') == 'applied'
-    cake_ok = shaped and owned_cake(q, shaping)
+    tree_ok = shaped and owned_tree(state['interface'], shaping)
     warnings = []
-    if shaped and not cake_ok:
-        warnings.append('Managed fair-share CAKE missing or modified; users are no longer isolated')
-    elif shaping.get('result') in ('skipped-custom-queue', 'cake-unavailable'):
+    if shaped and not tree_ok:
+        warnings.append('Managed per-URL share tree missing or modified (kernel modules after an update?); '
+                        'URLs are no longer isolated')
+    elif shaping.get('result') in ('skipped-custom-queue', 'modules-unavailable'):
         warnings.append('Fair share requested but not applied (' + shaping['result'] + '); flows still share via the default queue')
-    if not fq and not cake_ok:
+    if not fq and not tree_ok:
         warnings.append('Actual root is not FQ; sysctl/default_qdisc or active service does not prove FQ')
     if cc != 'bbr':
         warnings.append('Linux TCP BBR is not active (Hy2 has independent QUIC congestion control)')
@@ -390,7 +451,7 @@ def health(state_path):
             'isolated_root': layout['isolated'], 'fq_effective': fq,
             'managed_fq_matches': owned_ok if state.get('qdisc_changed') else None,
             'fair_share': {'result': shaping.get('result', 'not-requested'),
-                           'rate_mbps': shaping.get('rate_mbps'), 'cake_matches': cake_ok if shaped else None},
+                           'plan': shaping.get('plan'), 'tree_matches': tree_ok if shaped else None},
             'tcp_congestion_control': cc, 'default_qdisc': default,
             'last_action': state.get('qdisc_result', 'legacy-snapshot'), 'warnings': warnings}
 
@@ -399,8 +460,8 @@ def verify_health(state_path):
     report = health(state_path)
     if report['managed_fq_matches'] is False:
         raise RuntimeError('Managed FQ verification failed; inspect network status')
-    if report['fair_share']['cake_matches'] is False:
-        raise RuntimeError('Managed fair-share CAKE verification failed; inspect network status')
+    if report['fair_share']['tree_matches'] is False:
+        raise RuntimeError('Managed per-URL share tree verification failed; inspect network status')
     return report
 
 

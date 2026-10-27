@@ -19,7 +19,7 @@ import routing
 
 DOMAINS = routing.CLAUDE
 PROJECT_NAME = 'gowest'
-KIT_VERSION = '0.5.8'
+KIT_VERSION = '0.5.9'
 SELECT_GROUP = '出口选择'
 AUTO_GROUP = '自动回退'
 # Tailscale control plane stays direct on every Mihomo client:
@@ -71,7 +71,7 @@ def domain(value):
 def settings(raw):
     allowed = {'server_ip', 'node_prefix', 'hy2_up_mbps', 'hy2_down_mbps', 'ipv6',
                'tailnet', 'hosts', 'reality_server_name', 'hy2_server_name',
-               'subscription', 'traffic', 'users', 'fair_share'}
+               'subscription', 'traffic', 'users', 'fair_share', 'user_caps', 'user_port_base'}
     if set(raw) - allowed:
         raise ValueError('Unknown settings fields: ' + ', '.join(sorted(set(raw) - allowed)))
     s = copy.deepcopy(raw)
@@ -140,12 +140,28 @@ def settings(raw):
     if (type(users) is not list or len(users) > MAX_USERS or len(set(users)) != len(users)
             or not all(isinstance(u, str) and re.fullmatch(USER_NAME, u) for u in users)):
         raise ValueError(f'users must be 1-{MAX_USERS} unique names matching {USER_NAME}')
-    # Several people sharing one server: Hy2 switches to BBR and the egress
-    # gets CAKE per-host fairness (idle capacity is borrowed, busy links split).
+    # Several people sharing one server: each subscription URL is one share with
+    # its own port; HTB guarantees bandwidth/N per URL and lends idle capacity.
     s.setdefault('fair_share', len(users) > 1)
-    if type(s['fair_share']) is not bool:
-        raise ValueError('fair_share must be boolean')
+    if type(s['fair_share']) is not bool or (s['fair_share'] and len(users) < 2):
+        raise ValueError('fair_share needs at least two named users')
+    caps = s.setdefault('user_caps', {})
+    if type(caps) is not dict or set(caps) - set(users) or any(
+            type(v) is not int or not 0 < v <= 100000 for v in caps.values()):
+        raise ValueError('user_caps must map existing users to whole Mbps')
+    base = s.setdefault('user_port_base', 20000)
+    # Below the Linux ephemeral range (32768+) so outgoing sockets never hold them.
+    if type(base) is not int or not 1024 <= base or base + len(users) > 32767:
+        raise ValueError('user_port_base must keep per-user ports within 1025-32767')
+    reserved = {22, 443} | {x['port'] for x in subscription_endpoints(s)}
+    if users and reserved & set(proxy_ports(s)):
+        raise ValueError('Per-user proxy ports collide with SSH, 443 or subscription ports')
     return s
+
+
+def proxy_ports(s):
+    """One port per subscription URL in shared mode (TCP VLESS + UDP Hy2)."""
+    return [s['user_port_base'] + i for i in range(1, len(s['users']) + 1)] if s['users'] else [443]
 
 
 def parse_bytes(text):
@@ -165,8 +181,18 @@ def parse_bytes(text):
 
 
 def shape_mbps(s):
-    """CAKE rate: 95% of the plan so queues form here, not in the cloud shaper."""
+    """Shared rate: 95% of the plan so queues form here, not in the cloud shaper."""
     return max(1, int(s['hy2_down_mbps'] * 95 // 100)) if s['fair_share'] else 0
+
+
+def share_plan(s):
+    """What network.py builds: one HTB class per subscription URL."""
+    if not s['fair_share']:
+        return None
+    total = shape_mbps(s)
+    return {'rate_mbps': total, 'users': [
+        {'name': name, 'port': port, 'cap_mbps': min(s['user_caps'].get(name, total), total)}
+        for name, port in zip(s['users'], proxy_ports(s))]}
 
 
 def accounts(s, k):
@@ -174,8 +200,8 @@ def accounts(s, k):
 
     Without named users this is the legacy single account (flat file layout)."""
     if not s['users']:
-        return [dict(k, name='')]
-    return [dict(k, **user) for user in k['users']]
+        return [dict(k, name='', port=443)]
+    return [dict(k, port=port, **user) for user, port in zip(k['users'], proxy_ports(s))]
 
 
 def make_secrets(out, s):
@@ -208,23 +234,34 @@ def make_secrets(out, s):
 
 
 def server_config(s, k):
+    if not s['users']:
+        return {'log': {'level': 'warn'}, 'inbounds': inbound_pair(s, k, accounts(s, k), 443, ''),
+                'outbounds': [{'type': 'direct'}]}
+    # Shared mode: each URL owns a port, which is how the egress queue tells
+    # users apart (packets to clients carry no user identity otherwise).
+    inbounds = []
+    for a in accounts(s, k):
+        inbounds += inbound_pair(s, k, [a], a['port'], '-' + a['name'])
+    return {'log': {'level': 'warn'}, 'inbounds': inbounds, 'outbounds': [{'type': 'direct'}]}
+
+
+def inbound_pair(s, k, users, port, suffix):
     named = lambda a, extra: dict({'name': a['name']} if a['name'] else {}, **extra)
-    users = accounts(s, k)
-    return {'log': {'level': 'warn'}, 'inbounds': [
-        {'type': 'vless', 'tag': 'vless-in', 'listen': '::', 'listen_port': 443,
+    return [
+        {'type': 'vless', 'tag': 'vless-in' + suffix, 'listen': '::', 'listen_port': port,
          'users': [named(a, {'uuid': a['uuid'], 'flow': 'xtls-rprx-vision'}) for a in users],
          'tls': {'enabled': True, 'server_name': s['reality_server_name'],
                  'reality': {'enabled': True,
                              'handshake': {'server': s['reality_server_name'], 'server_port': 443},
                              'private_key': k['reality_private_key'], 'short_id': [k['short_id']]}}},
-        {'type': 'hysteria2', 'tag': 'hy2-in', 'listen': '::', 'listen_port': 443,
+        {'type': 'hysteria2', 'tag': 'hy2-in' + suffix, 'listen': '::', 'listen_port': port,
          'users': [named(a, {'password': a['hy2_password']}) for a in users],
          'obfs': {'type': 'salamander', 'password': k['obfs_password']},
          # Shared servers: clients are told to use BBR instead of fixed-rate
          # Brutal, which would ignore the fair-share queue and starve others.
          'ignore_client_bandwidth': s['fair_share'],
          'tls': {'enabled': True, 'alpn': ['h3'], 'certificate_path': '/etc/la-vpn/hy2.crt',
-                 'key_path': '/etc/la-vpn/hy2.key'}}], 'outbounds': [{'type': 'direct'}]}
+                 'key_path': '/etc/la-vpn/hy2.key'}}]
 
 
 def client_config(s, k, strict=False):
@@ -271,11 +308,11 @@ def client_config(s, k, strict=False):
                         'sniff': {'HTTP': {'ports': [80, '8080-8880'], 'override-destination': True},
                                   'TLS': {'ports': [443, 8443]}, 'QUIC': {'ports': [443, 8443]}}},
             'proxies': [
-                {'name': vl, 'type': 'vless', 'server': s['server_ip'], 'port': 443, 'uuid': k['uuid'],
+                {'name': vl, 'type': 'vless', 'server': s['server_ip'], 'port': k.get('port', 443), 'uuid': k['uuid'],
                  'udp': True, 'tls': True, 'network': 'tcp', 'flow': 'xtls-rprx-vision',
                  'servername': s['reality_server_name'], 'client-fingerprint': 'chrome',
                  'reality-opts': {'public-key': k['reality_public_key'], 'short-id': k['short_id']}},
-                {'name': hy, 'type': 'hysteria2', 'server': s['server_ip'], 'port': 443,
+                {'name': hy, 'type': 'hysteria2', 'server': s['server_ip'], 'port': k.get('port', 443),
                  'password': k['hy2_password'], 'obfs': 'salamander', 'obfs-password': k['obfs_password'],
                  'sni': s['hy2_server_name'], 'alpn': ['h3'], 'skip-cert-verify': True,
                  'fingerprint': k['certificate_fingerprint'],
@@ -301,8 +338,9 @@ def node_subscription(s, k):
     vl = urlencode({'encryption': 'none', 'security': 'reality', 'type': 'tcp',
                     'sni': s['reality_server_name'], 'fp': 'chrome',
                     'pbk': k['reality_public_key'], 'sid': k['short_id'], 'flow': 'xtls-rprx-vision'})
-    lines = [f"hysteria2://{quote(k['hy2_password'], safe='')}@{s['server_ip']}:443/?{hy}#{s['node_prefix']}-Hy2",
-             f"vless://{k['uuid']}@{s['server_ip']}:443?{vl}#{s['node_prefix']}-VLESS"]
+    port = k.get('port', 443)
+    lines = [f"hysteria2://{quote(k['hy2_password'], safe='')}@{s['server_ip']}:{port}/?{hy}#{s['node_prefix']}-Hy2",
+             f"vless://{k['uuid']}@{s['server_ip']}:{port}?{vl}#{s['node_prefix']}-VLESS"]
     return base64.b64encode(('\n'.join(lines) + '\n').encode()).decode() + '\n'
 
 

@@ -25,9 +25,11 @@ def expected_ports(raw, ssh_port=22):
     if type(ssh_port) is not int or not 1 <= ssh_port <= 65535:
         raise ValueError('SSH 端口必须是 1–65535 的整数')
     subscriptions = [x['port'] for x in render.subscription_endpoints(s)]
-    if ssh_port in [443] + subscriptions:
-        raise ValueError('SSH 端口不能与代理 TCP 443 或订阅端口冲突')
-    return [f'TCP:{ssh_port}'] + [f'TCP:{port}' for port in subscriptions] + ['TCP:443', 'UDP:443', 'ICMP']
+    proxies = render.proxy_ports(s)
+    if ssh_port in proxies + subscriptions:
+        raise ValueError('SSH 端口不能与代理端口或订阅端口冲突')
+    return ([f'TCP:{ssh_port}'] + [f'TCP:{port}' for port in subscriptions]
+            + [f'{proto}:{port}' for port in proxies for proto in ('TCP', 'UDP')] + ['ICMP'])
 
 
 def rule(protocol, source, note):
@@ -44,9 +46,16 @@ def generate(raw, ssh_sources=None, ssh_port=22, allow_world_ssh=False):
     if WORLD in sources and not allow_world_ssh:
         raise ValueError('SSH 对全网开放需显式指定 --allow-world-ssh')
     rows = [rule(ports[0], source, 'SSH 管理（建议收窄来源）') for source in sources]
-    rows += [rule(port, WORLD, '订阅下载') for port in ports[1:-3]]
-    rows += [rule('TCP:443', WORLD, 'VLESS REALITY'),
-             rule('UDP:443', WORLD, 'Hysteria2'), rule('ICMP', WORLD, '诊断及路径 MTU')]
+    s = render.settings(raw)
+    owners = dict(zip(render.proxy_ports(s), s['users'])) if s['users'] else {}
+    for port in ports[1:-1]:
+        proto, number = port.split(':')
+        if port.startswith('TCP:') and int(number) not in render.proxy_ports(s):
+            rows.append(rule(port, WORLD, '订阅下载'))
+        else:
+            who = (' · ' + owners[int(number)]) if int(number) in owners else ''
+            rows.append(rule(port, WORLD, ('VLESS REALITY' if proto == 'TCP' else 'Hysteria2') + who))
+    rows.append(rule('ICMP', WORLD, '诊断及路径 MTU'))
     result = {'data': rows}
     report = check(raw, result, ssh_port)
     if report['errors']:
