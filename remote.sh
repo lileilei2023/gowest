@@ -1,7 +1,7 @@
 #!/bin/sh
 # Run from your own computer: copy this kit to a server over SSH, then
-# install, upgrade or manage it there. The server needs no git and no
-# access to this (private) repository.
+# install, upgrade or manage it there. The server needs no git and never
+# downloads anything from this repository itself.
 #
 #   ./remote.sh ui                                  打开本地管理页面（浏览器）
 #   ./remote.sh root@203.0.113.7                    首次安装（中文向导）

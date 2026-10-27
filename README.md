@@ -7,6 +7,7 @@
   <img alt="platform" src="https://img.shields.io/badge/server-Ubuntu%2024.04%20amd64%20%7C%20arm64-e95420">
   <img alt="sing-box" src="https://img.shields.io/badge/sing--box-1.14.3-0ea5e9">
   <img alt="tests" src="https://img.shields.io/badge/tests-274%20passed-22c55e">
+  <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-blue">
   <img alt="clients" src="https://img.shields.io/badge/clients-macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-64748b">
 </p>
 
@@ -219,5 +220,9 @@ python3 -B -m unittest discover -s tests -v
 - 每个链接的用量按端口统计，服务器重启后的头一两分钟不计入。整台服务器的流量上限和暂停作用于所有人。
 - 一个人用的安装（端口 443）不能事后加人；要多人共用请在安装时就选 2 份或以上。
 - 本仓库不含任何节点的密钥或订阅。顶部动画和界面截图为示意图，IP、延迟等数值仅作演示；带宽实测图是真实数据。
+
+## 📄 许可证
+
+[GPL-3.0](LICENSE)：可以自由使用、修改和分发；分发修改后的版本时，也需要以 GPL-3.0 开源。网页里内置的二维码库 [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) 使用 MIT 许可证。
 
 本项目仅供学习与研究网络技术使用，请遵守当地法律法规和服务条款。
