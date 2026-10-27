@@ -27,7 +27,7 @@
 
 **gowest** 是一个面向个人自建场景的代理部署工具。在一台**空白的 Ubuntu 24.04** 服务器上运行一次中文向导，它会：
 
-- 安装经过 SHA-256 校验的 **sing-box**，同机提供 **Hysteria2（UDP 443）** 与 **VLESS + REALITY（TCP 443）** 两条线路；
+- 安装经过 SHA-256 校验的 **sing-box**，同机提供 **Hysteria2（UDP）** 与 **VLESS + REALITY（TCP）** 两条线路（一份时用 443 端口，多份时每个订阅链接一个独立端口）；
 - 为每台新服务器生成独立的密钥、证书和随机订阅令牌；
 - 一次生成 **macOS / Windows / Android / iOS** 四端可用的订阅，并带好统一的分流代理组；
 - 支持**几个人共用一台服务器**：份数由你决定，每份一个订阅链接；带宽按链接分配，忙时均分、闲时可以用满，也可以给单个链接设上限；并按**每月流量上限**提醒或暂停；
@@ -49,7 +49,7 @@
 | 🧭 | **统一代理组** | `出口选择 / 自动回退 / AI / Claude / YouTube / TikTok`，多台服务器只靠节点前缀（LA、DC…）区分 |
 | 🛡️ | **事务式安装** | 只接受全新服务器；30 分钟保护定时器、失败回滚、可恢复归档，SSH 断线不影响安装 |
 | ⚡ | **保守的网络优化** | BBR、只替换默认队列的安全 FQ、4/32 MiB 缓冲、TCP MTU 探测 |
-| 🔥 | **防火墙辅助** | 安全新增 UFW 规则（不动 SSH、不清空规则）；提供 HTTP/HTTPS 两份云安全组模板 |
+| 🔥 | **防火墙辅助** | 安全新增 UFW 规则（不动 SSH、不清空规则），多份时按每个链接的端口放行；`firewall generate` 按实际端口生成云安全组模板，另附一份时可直接用的 HTTP/HTTPS 模板 |
 | 🧪 | **可验证** | 离线配置检查、真实内核语法校验、回环协议测试、客户端出口 / STUN / 小流量测速工具 |
 
 ## 📸 效果预览
@@ -133,6 +133,7 @@ sudo bash deploy.sh
 
 # 3. 查看各客户端的导入方式
 sudo bash /opt/la-vpn/deploy.sh urls --client mac        # 或 windows / android / shadowrocket
+sudo bash /opt/la-vpn/deploy.sh urls --user alice --client mac   # 多份时指定是哪个链接
 ```
 
 <details>
@@ -144,8 +145,12 @@ bash deploy.sh init --server-ip <新服务器IP> --node-prefix DC --bandwidth 10
   --users alice,bob:20Mbps,carol --monthly-quota 1TB --on-exceed stop \
   --accept-http-risk --output settings.local.json
 
-# 查看计划，不联网、不做改动
+# 查看计划，不联网、不做改动（会列出需要放行的端口）
 bash deploy.sh plan --settings settings.local.json
+
+# 按实际端口生成云安全组模板（SSH 来源换成你的管理出口）
+bash deploy.sh firewall generate --settings settings.local.json \
+  --ssh-source <你的管理IP>/32 --output firewall.local.json
 
 # 在本地离线生成一套配置并检查（需要 Python 3.10+、OpenSSL、PyYAML）
 python3 -B render.py --settings settings.local.json --output generated-review
@@ -200,9 +205,10 @@ Mac / Windows 用户可以直接运行 `clients/` 里的一键脚本：脚本会
 ```text
 gowest/
 ├── deploy.sh / launcher.py   # 中文向导与统一入口
-├── vpn.py                    # plan / install / status / verify / urls / rollback
-├── render.py                 # 生成独立密钥、Clash YAML、小火箭配置
-├── network.py                # BBR / FQ / 缓冲：快照、优化、恢复
+├── vpn.py                    # plan / install / status / verify / urls / bandwidth / traffic / rollback
+├── render.py                 # 每个订阅链接的独立密钥与端口、Clash YAML、小火箭配置
+├── network.py                # BBR / FQ / 缓冲，以及按链接分配的 HTB 队列：快照、应用、恢复
+├── subinfo.py                # 月流量统计、订阅用量显示、超额暂停与恢复
 ├── hostfirewall.py           # 保守新增 UFW 规则并支持回滚
 ├── firewall.py, firewall/    # 云安全组模板的生成与校验
 ├── check.py / probe.py       # 离线一致性检查；客户端出口与测速
@@ -231,7 +237,7 @@ python3 -B -m unittest discover -s tests -v
 - 没有系统级 kill switch，也不承诺零泄漏、住宅 IP 或某个服务一定不会触发风控。
 - 不要把带令牌的订阅地址贴到公开日志、仓库或在线订阅转换网站。
 
-更多细节（参数说明、DNS/TUN 规则、FQ 策略、回滚语义）见 **[详细说明](docs/详细说明.md)**；各版本的改动见 [CHANGELOG](CHANGELOG.md)。
+更多细节（参数说明、DNS/TUN 规则、FQ 与按链接分配策略、回滚语义）见 **[详细说明](docs/详细说明.md)**；各版本的改动见 [CHANGELOG](CHANGELOG.md)。
 
 ## 📜 免责声明
 

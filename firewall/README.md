@@ -9,6 +9,8 @@
 | HTTP 订阅，默认 80 | `Firewall-Rule-Template-json.json` | TCP 22、80、443；UDP 443；ICMP |
 | HTTPS 订阅，默认 8443 | `Firewall-Rule-Template-https-json.json` | TCP 22、8443、443；UDP 443；ICMP |
 
+这两份静态模板只适用于一份（端口 443）的部署。多份（每个订阅链接一个端口，默认 20001 起）请用 `firewall generate --settings ...` 按实际端口生成，它会为每个链接放行 TCP 和 UDP，并在备注里写上用户名。
+
 两份静态模板均为“接受 / 高优先级 / 0.0.0.0/0”，适合首次部署。它们不包含服务器 IP、节点密钥、订阅令牌或设备地址。HTTPS 模板只放行端口，不负责证书申请/续期。
 
 - TCP 22：SSH。稳定后建议限定为可信管理出口 IP/32 或网段；公网开放并不因免密登录就没有风险。收窄前保留第二个 SSH 会话和云控制台救援入口，使用真实管理出口而不是随意照抄示例 IP。`--ssh-port` 只描述规则，不修改 sshd。
