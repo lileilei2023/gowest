@@ -165,19 +165,26 @@ def proxy_ports(s):
 
 
 def parse_bytes(text):
-    """'1TB', '512GB', '1.5TiB' -> bytes. GB/TB are decimal (as most cloud
-    plans bill); GiB/TiB are binary. Empty or 0 means no quota."""
+    """'1TB', '512GB', '800', '1.5TiB' -> bytes. A bare number is GB, like a bare
+    bandwidth is Mbps. GB/TB are decimal (as most cloud plans bill); GiB/TiB are
+    binary. Empty or 0 means no quota."""
     value = str(text).strip().replace(' ', '')
     if value in ('', '0'):
         return 0
-    match = re.fullmatch(r'(\d+(?:\.\d+)?)(GB|TB|GiB|TiB)', value, re.I)
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)(GB|TB|GiB|TiB)?', value, re.I)
     if not match:
-        raise ValueError('流量上限请写成 512GB、1TB、1.5TB 或 1TiB 这样的形式')
+        raise ValueError('流量上限请写成 800（即 800GB）、512GB、1TB、1.5TB 或 1TiB 这样的形式')
     units = {'gb': 10**9, 'tb': 10**12, 'gib': 2**30, 'tib': 2**40}
-    result = int(Decimal(match.group(1)) * units[match.group(2).lower()])
+    result = int(Decimal(match.group(1)) * units[(match.group(2) or 'GB').lower()])
     if result <= 0:
         raise ValueError('流量上限必须大于 0')
     return result
+
+
+def format_gb(value):
+    """Bytes -> '312.4 GB' (decimal, matching how quotas are entered)."""
+    gb = round(value / 10**9, 1)
+    return (f'{gb:.0f}' if gb == int(gb) else f'{gb:.1f}') + ' GB'
 
 
 def shape_mbps(s):

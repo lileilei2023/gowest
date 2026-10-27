@@ -153,7 +153,7 @@ def wizard():
         users, caps = parse_users(prompt('共用份数或名字（回车 = 1 份；如 3 或 alice,bob:20Mbps,carol）'))
         if users:
             print(f'{len(users)} 份，每份一个订阅链接和独立端口；忙时按链接均分，闲时可借满（或到该链接上限）。')
-        quota = prompt('每月流量上限（如 1TB、512GB；回车 = 不设置）')
+        quota = prompt('每月流量上限（如 1TB、512GB，只写数字按 GB；回车 = 不设置）')
         on_exceed = 'warn'
         if render.parse_bytes(quota):
             on_exceed = prompt('超出后：warn = 只提醒，stop = 暂停代理到下月', 'warn')
@@ -240,7 +240,7 @@ def main(argv=None):
     init.add_argument('--private-key', default='')
     init.add_argument('--tailnet', default='')
     init.add_argument('--users', default='', help='共用份数（如 3）或名字，可带上限（alice,bob:20Mbps）；默认 1 份')
-    init.add_argument('--monthly-quota', default='', help='每月流量上限，如 1TB、512GB；默认不设置')
+    init.add_argument('--monthly-quota', default='', help='每月流量上限，如 1TB、512GB 或 800（按 GB）；默认不设置')
     init.add_argument('--metering', choices=('both', 'outbound'), default='both',
                       help='云套餐计量方式：both = 进+出（默认，偏保守）；outbound = 只计出方向')
     init.add_argument('--on-exceed', choices=('warn', 'stop'), default='warn',

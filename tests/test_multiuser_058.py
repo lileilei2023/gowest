@@ -70,6 +70,8 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(render.parse_bytes('1.5 TB'), 15 * 10**11)
         self.assertEqual(render.parse_bytes('1TiB'), 2**40)
         self.assertEqual(render.parse_bytes(''), 0)
+        self.assertEqual(render.parse_bytes('800'), 800 * 10**9, 'bare number is GB')
+        self.assertEqual(render.parse_bytes('1.5'), 15 * 10**8)
         for bad in ('1T', '512MB', '-1TB', 'lots', '0.0GB'):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 render.parse_bytes(bad)
@@ -334,6 +336,19 @@ class QuotaTests(unittest.TestCase):
     def enforce(self, used, month='2026-10', **traffic):
         traffic = dict({'total_bytes': 1000, 'on_exceed': 'stop', 'metering': 'both'}, **traffic)
         return subinfo.enforce(traffic, used, month, systemctl=lambda *a: self.calls.append(a))
+
+    def test_status_shows_gb(self):
+        self.assertEqual(render.format_gb(10**12), '1000 GB')
+        self.assertEqual(render.format_gb(312_400_000_000), '312.4 GB')
+        self.assertEqual(render.format_gb(12_340_000_000), '12.3 GB')
+        self.assertEqual(render.format_gb(0), '0 GB')
+        summary = vpn.traffic_summary({'month': '2026-10', 'used_bytes': 312_400_000_000,
+                                       'quota_bytes': 10**12, 'percent': 31.2, 'metering': 'both',
+                                       'on_exceed': 'stop', 'paused_month': None})
+        self.assertEqual(summary['used'], '312.4 GB / 1000 GB（31.2%）')
+        self.assertEqual(summary['paused'], '否')
+        self.assertEqual(vpn.traffic_summary({'month': '2026-10', 'used_bytes': 5 * 10**9, 'quota_bytes': 0,
+                                              'percent': None})['used'], '5 GB（未设置上限）')
 
     def test_outbound_metering(self):
         self.assertEqual(subinfo.used_bytes(300, 500, 'outbound'), 500)

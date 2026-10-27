@@ -26,7 +26,7 @@ import hostfirewall
 import kit_runtime
 from installlog import InstallLog, redact
 from render import (dump, render, settings, SUBSCRIPTION_FILES, account_dir, accounts, client_files, shape_mbps,
-                    proxy_ports, share_plan,
+                    proxy_ports, share_plan, format_gb,
                     android_guide_text, desktop_guide_text, shadowrocket_guide_text, subscription_endpoints)
 
 HERE = Path(__file__).resolve().parent
@@ -667,6 +667,17 @@ def show_transports(transport, client, user=''):
             print(shadowrocket_guide_text(base, cfg['node_prefix'], user))
 
 
+def traffic_summary(record):
+    """traffic.json (bytes) -> human GB for status; raw bytes stay in the file."""
+    quota = record.get('quota_bytes')
+    used = format_gb(record['used_bytes'])
+    return {'month': record['month'],
+            'used': used + (f' / {format_gb(quota)}（{record["percent"]}%）' if quota else '（未设置上限）'),
+            'metering': {'both': '进+出', 'outbound': '只计出方向'}.get(record.get('metering'), record.get('metering')),
+            'on_exceed': record.get('on_exceed'),
+            'paused': '已暂停（' + record['paused_month'] + '）' if record.get('paused_month') else '否'}
+
+
 def installed(confirm):
     s = load_state()
     if s['status'] != 'installed' or confirm != s['server_ip']:
@@ -726,7 +737,8 @@ def change_traffic(confirm, quota=None, metering=None, on_exceed=None):
     replace_managed(s, CONFIG / 'settings.json', dump(cfg), 0o600)
     # Refresh the header and quota decision now instead of waiting five minutes.
     run(['systemctl', 'start', 'la-vpn-subinfo.service'], check=False, timeout=60)
-    print(dump({'traffic': cfg['traffic']}))
+    print(dump({'traffic': dict(cfg['traffic'], monthly_quota=format_gb(cfg['traffic']['total_bytes'])
+                                if cfg['traffic']['total_bytes'] else '不设置')}))
 
 
 def main(argv=None):
@@ -759,7 +771,7 @@ def main(argv=None):
     item.add_argument('--cap', help='与 --user 一起用：该链接最高速率，如 20Mbps；none 表示不限（可用满总带宽）')
     item.add_argument('--confirm-server', required=True)
     item = sub.add_parser('traffic', help='调整每月流量上限、计量方式和超额动作')
-    item.add_argument('--quota', help='如 512GB、1TB；0 表示不设置')
+    item.add_argument('--quota', help='如 800（即 800GB）、512GB、1TB；0 表示不设置')
     item.add_argument('--metering', choices=('both', 'outbound'))
     item.add_argument('--on-exceed', choices=('warn', 'stop'))
     item.add_argument('--confirm-server', required=True)
@@ -780,7 +792,7 @@ def main(argv=None):
                                          if cfg['fair_share'] else 'replace only default pfifo_fast; leave custom queues'),
                         'users': cfg['users'] or ['(single)'], 'fair_share': cfg['fair_share'],
                         'fair_share_rate_mbps': shape_mbps(cfg) or None,
-                        'monthly_quota_bytes': cfg['traffic']['total_bytes'] or None,
+                        'monthly_quota': format_gb(cfg['traffic']['total_bytes']) if cfg['traffic']['total_bytes'] else None,
                         'quota_metering': cfg['traffic']['metering'], 'on_exceed': cfg['traffic']['on_exceed'],
                         'fresh_host_required': True, 'firewall_changes': 'install: safe UFW additions only; no cloud changes',
                         'cloud_firewall': 'unverified; manual cloud-console confirmation required', 'client_changes': False,
@@ -828,7 +840,7 @@ def main(argv=None):
         print(dump({'host_firewall': s.get('host_firewall', {}).get('report', 'not recorded'),
                     'cloud_firewall': 'unverified'}))
         usage = STATE / 'traffic.json'
-        print(dump({'monthly_traffic': json.loads(usage.read_text()) if usage.is_file()
+        print(dump({'monthly_traffic': traffic_summary(json.loads(usage.read_text())) if usage.is_file()
                     else 'not measured yet (vnStat needs a few minutes)'}))
     elif args.command == 'urls':
         if load_state()['status'] != 'installed':

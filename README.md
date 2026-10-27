@@ -7,7 +7,7 @@
   <img alt="platform" src="https://img.shields.io/badge/server-Ubuntu%2024.04%20amd64%20%7C%20arm64-e95420">
   <img alt="sing-box" src="https://img.shields.io/badge/sing--box-1.14.3-0ea5e9">
   <img alt="python" src="https://img.shields.io/badge/python-3.10%2B-3776ab">
-  <img alt="tests" src="https://img.shields.io/badge/tests-231%20passed-22c55e">
+  <img alt="tests" src="https://img.shields.io/badge/tests-232%20passed-22c55e">
   <img alt="clients" src="https://img.shields.io/badge/clients-macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-64748b">
 </p>
 
@@ -44,7 +44,7 @@
 | 🔀 | **同机双协议 + 自动回退** | Hy2 优先，健康检查失败时切到 VLESS；不会悄悄回落到直连 |
 | 📱 | **四端订阅一次生成** | Clash Verge Rev、Clash Meta for Android 一键导入链接；Shadowrocket 原生节点 + 两份 `.conf` |
 | 👥 | **按订阅链接分配带宽** | N 份 = N 个订阅链接；每个链接保底 1/N、空闲时借满，可单独设上限；同一设备开多个链接、开再多连接都不影响别人的份额 |
-| 📊 | **月流量配额** | 填 `1TB` / `512GB`，客户端订阅显示已用量；可选超额后自动暂停代理，下月或调高上限后自动恢复 |
+| 📊 | **月流量配额** | 填 `1TB` / `512GB` / `800`（只写数字按 GB），客户端订阅显示已用量；可选超额后自动暂停代理，下月或调高上限后自动恢复 |
 | 🎚️ | **带宽在线调整** | `bandwidth --set 200Mbps` 或 `bandwidth --user bob --cap 20Mbps` 立即生效，不改密钥、不换订阅地址 |
 | 🧭 | **统一代理组** | `出口选择 / 自动回退 / AI / Claude / YouTube / TikTok`，多台服务器只靠节点前缀（LA、DC…）区分 |
 | 🛡️ | **事务式安装** | 只接受全新服务器；30 分钟保护定时器、失败回滚、可恢复归档，SSH 断线不影响安装 |
@@ -107,7 +107,8 @@ sudo bash /opt/la-vpn/deploy.sh bandwidth --user bob --cap 20Mbps --confirm-serv
 sudo bash /opt/la-vpn/deploy.sh urls --user alice --client mac   # 查看某个链接的导入方式
 ```
 
-- `GB` / `TB` 按十进制计算（多数云厂商按此计费），`GiB` / `TiB` 按二进制计算。
+- 单位：流量支持 `GB` / `TB`（十进制，1TB = 1000GB，多数云厂商按此计费）和 `GiB` / `TiB`（二进制），只写数字时按 GB；带宽支持 `Mbps` / `Gbps`（1Gbps = 1000Mbps），只写数字时按 Mbps。`MB/s` 这类字节单位会被拒绝，避免和 `Mbps` 混淆。
+- `status` 会以 GB 显示本月用量，例如 `312.4 GB / 1000 GB（31.2%）`。
 - 默认把进、出两个方向都算进用量（偏保守）。如果你的套餐只计出方向，加 `--metering outbound`。
 - `--on-exceed warn` 只在订阅和 `status` 里显示用量；`stop` 会在达到上限时暂停代理，到下个月或调高上限后自动恢复。你自己手动停掉的服务，它不会去启动。
 - 用量按自然月统计（vnStat），是整台服务器的总流量，不区分链接。
@@ -214,7 +215,7 @@ gowest/
 ├── check.py / probe.py       # 离线一致性检查；客户端出口与测速
 ├── clients/                  # Mac / Windows 一键安装与导入脚本
 ├── native/, build_native.py  # Nuitka 原生编译（交付时不带源码）
-├── tests/                    # 231 个离线测试，以及 netns / 回环集成测试
+├── tests/                    # 232 个离线测试，以及 netns / 回环集成测试
 └── docs/                     # 详细说明、快速部署、桌面 / 小火箭使用指南、原生编译
 ```
 
