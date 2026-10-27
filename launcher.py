@@ -217,6 +217,10 @@ def dispatch(arguments):
     if kit_runtime.compiled():
         import vpn
         return vpn.main(arguments)
+    # exec replaces this process without flushing; over SSH (no TTY) stdout is
+    # block-buffered, so earlier messages would silently disappear.
+    sys.stdout.flush()
+    sys.stderr.flush()
     os.execv(sys.executable, [sys.executable, '-B', str(ROOT / 'vpn.py')] + arguments)
 
 

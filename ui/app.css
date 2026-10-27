@@ -318,3 +318,4 @@ button, input, select { font: inherit; color: inherit; }
 .badge, .chip { white-space: nowrap; }
 .qr-wrap > div { min-width: 0; }
 .bar.empty > i { width: 0; }
+.progress i.fail { background: var(--bad); animation: none; }

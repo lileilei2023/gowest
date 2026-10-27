@@ -63,6 +63,17 @@ class CommandTests(unittest.TestCase):
         self.assertFalse(any('__pycache__' in n for n in names))
 
 
+class OutputTests(unittest.TestCase):
+    def test_messages_before_exec_survive_a_pipe(self):
+        """Over SSH stdout is a pipe; exec must not drop what quick printed first."""
+        import subprocess
+        kit = Path(__file__).resolve().parents[1]
+        p = subprocess.run([sys.executable, '-B', '-c',
+                            "import launcher; print('before-exec'); launcher.dispatch(['plan', '--help'])"],
+                           cwd=kit, capture_output=True, text=True, timeout=30)
+        self.assertIn('before-exec', p.stdout)
+        self.assertIn('--settings', p.stdout)
+
 class AccessTests(unittest.TestCase):
     def handler(self, host, origin=None):
         h = SimpleNamespace(headers={'Host': host, **({'Origin': origin} if origin else {})}, port=8123)

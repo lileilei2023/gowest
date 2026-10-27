@@ -379,6 +379,7 @@ function runJob(jobId, title, server) {
     $('#job-state', el).innerHTML = d.ok ? '<b style="color:var(--good)">已完成</b>' : '<b style="color:var(--bad)">没有成功，详情见上面的输出</b>';
     $('#job-close', el).textContent = '关闭';
     if (d.ok) bars.forEach((b) => { b.className = 'done'; });
+    else bars.forEach((b) => { if (b.className === 'run' || (!b.className && b === bars[Math.ceil(stage) - 1])) b.className = 'fail'; });
     loadStatus(server);
   };
   tick();

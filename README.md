@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="docs/images/promo.webp" alt="gowest：一条命令部署双协议代理，多人共用、流量配额" width="100%">
+  <img src="docs/images/promo.webp" alt="gowest：几个人合租一台服务器，一条命令部署，按人管流量，本地网页管理" width="100%">
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.8.0-6366f1">
+  <img alt="version" src="https://img.shields.io/badge/version-0.8.1-6366f1">
   <img alt="platform" src="https://img.shields.io/badge/server-Ubuntu%2024.04%20amd64%20%7C%20arm64-e95420">
   <img alt="sing-box" src="https://img.shields.io/badge/sing--box-1.14.3-0ea5e9">
-  <img alt="tests" src="https://img.shields.io/badge/tests-271%20passed-22c55e">
+  <img alt="tests" src="https://img.shields.io/badge/tests-272%20passed-22c55e">
   <img alt="clients" src="https://img.shields.io/badge/clients-macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-64748b">
 </p>
 
