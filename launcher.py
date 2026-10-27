@@ -17,11 +17,12 @@ import autoconfig
 import kit_runtime
 
 ROOT = Path(__file__).resolve().parent
-MANAGEMENT = {'plan', 'install', 'status', 'verify', 'urls', 'rollback', 'repair-fq'}
+MANAGEMENT = {'plan', 'install', 'status', 'verify', 'urls', 'rollback', 'repair-fq', 'bandwidth', 'traffic'}
 
 
 def build_settings(server_ip, up, down, mode, host='', cert='', key='', tailnet='',
-                   accept_http_risk=False, subscription_port=None, node_prefix='LA', http_port=80):
+                   accept_http_risk=False, subscription_port=None, node_prefix='LA', http_port=80,
+                   users=(), quota='', metering='both', on_exceed='warn'):
     ip = ipaddress.IPv4Address(server_ip)
     if not ip.is_global:
         raise ValueError('请填写新服务器的真实公网 IPv4，不要使用示例/内网地址。')
@@ -43,8 +44,25 @@ def build_settings(server_ip, up, down, mode, host='', cert='', key='', tailnet=
             subscription.update(http_port=http_port, allow_insecure_http=True)
     return render.settings({'server_ip': str(ip), 'hy2_up_mbps': up, 'hy2_down_mbps': down,
                             'node_prefix': node_prefix, 'ipv6': True, 'tailnet': tailnet,
-                            'hosts': {}, 'subscription': subscription,
-                            'traffic': {'total_bytes': 0, 'expire_epoch': 0}})
+                            'hosts': {}, 'subscription': subscription, 'users': list(users),
+                            'traffic': {'total_bytes': render.parse_bytes(quota), 'expire_epoch': 0,
+                                        'metering': metering, 'on_exceed': on_exceed}})
+
+
+def parse_users(text):
+    """'' or '1' -> single user; '3' -> user1..user3; 'alice,bob' -> those names."""
+    value = str(text or '').strip().replace('，', ',').replace(' ', '')
+    if value in ('', '1'):
+        return []
+    if value.isdigit():
+        count = int(value)
+        if not 2 <= count <= render.MAX_USERS:
+            raise ValueError(f'共用人数需在 1-{render.MAX_USERS} 之间')
+        return [f'user{i}' for i in range(1, count + 1)]
+    names = [x.lower() for x in value.split(',') if x]
+    if len(names) == 1:
+        raise ValueError('只有一人时直接回车即可；多人请输入人数或至少两个名字')
+    return names
 
 
 def save_settings(config, output):
@@ -123,6 +141,13 @@ def wizard():
             address = prompt('新服务器公网 IPv4')
         prefix = prompt('服务器标签（仅区分节点，例如 LA、DC；各机代理组名称一致）', 'LA')
         up, down = prompt_bandwidth()
+        users = parse_users(prompt('共用人数或名字（回车 = 1 人；如 3 或 alice,bob,carol）'))
+        if users:
+            print(f'{len(users)} 人各自独立凭据和订阅；忙时按设备公平分配带宽，闲时一人可用满。')
+        quota = prompt('每月流量上限（如 1TB、512GB；回车 = 不设置）')
+        on_exceed = 'warn'
+        if render.parse_bytes(quota):
+            on_exceed = prompt('超出后：warn = 只提醒，stop = 暂停代理到下月', 'warn')
         print('所有方式都生成电脑、Android、小火箭配置，无需逐端选择。')
         print('1 = HTTPS（需域名证书）；2 = HTTP（明文风险）；3 或 1,2 = 同时提供 HTTPS 和 HTTP。')
         choice = prompt('订阅方式（默认 HTTP）', '2')
@@ -137,7 +162,7 @@ def wizard():
         accepted = mode == 'https' or prompt('确认 HTTP 会明文传输同一套节点凭据，请输入 HTTP', '') == 'HTTP'
         tailnet = prompt('可选：自己的 xxx.ts.net 域名，留空跳过')
         config = build_settings(address, up, down, mode, host, cert, key, tailnet, accepted,
-                                node_prefix=prefix)
+                                node_prefix=prefix, users=users, quota=quota, on_exceed=on_exceed)
         save_settings(config, output)
     subprocess.run(kit_runtime.command(['plan', '--settings', str(output)]), check=True)
     if platform.system() != 'Linux' or os.geteuid() != 0:
@@ -181,7 +206,7 @@ def main(argv=None):
         import subinfo
         return subinfo.main()
     parser = argparse.ArgumentParser(prog='gowest', description=render.PROJECT_NAME + '：双客户端代理部署与配置生成', epilog=(
-        '无参数：交互向导。管理命令：plan / install / status / verify / urls / rollback / repair-fq。'
+        '无参数：交互向导。管理命令：plan / install / status / verify / urls / bandwidth / traffic / rollback / repair-fq。'
         'firewall generate / check 离线准备云端模板。'
         '各命令可加 --help；脚本不会自动 SSH，也不会自动提权。'))
     parser.add_argument('--version', action='version', version=render.PROJECT_NAME + ' ' + render.KIT_VERSION)
@@ -203,6 +228,12 @@ def main(argv=None):
     init.add_argument('--certificate', default='')
     init.add_argument('--private-key', default='')
     init.add_argument('--tailnet', default='')
+    init.add_argument('--users', default='', help='多人共用：人数（如 3）或名字（alice,bob）；默认 1 人')
+    init.add_argument('--monthly-quota', default='', help='每月流量上限，如 1TB、512GB；默认不设置')
+    init.add_argument('--metering', choices=('both', 'outbound'), default='both',
+                      help='云套餐计量方式：both = 进+出（默认，偏保守）；outbound = 只计出方向')
+    init.add_argument('--on-exceed', choices=('warn', 'stop'), default='warn',
+                      help='超出上限：warn 只提醒；stop 暂停代理直到下月或上限调高')
     init.add_argument('--output', default='settings.local.json')
     commands.add_parser('firewall', help='离线生成/校验防火墙模板；详见 firewall --help')
     offline = commands.add_parser('render', help='离线生成全部客户端配置；不安装、不发布链接')
@@ -223,7 +254,8 @@ def main(argv=None):
     address = a.server_ip or autoconfig.detect_public_ipv4()['address']
     config = build_settings(address, up, down, mode,
                             a.subscription_host, a.certificate, a.private_key, a.tailnet,
-                            a.accept_http_risk, a.subscription_port, a.node_prefix, a.http_port)
+                            a.accept_http_risk, a.subscription_port, a.node_prefix, a.http_port,
+                            parse_users(a.users), a.monthly_quota, a.metering, a.on_exceed)
     save_settings(config, a.output)
 
 

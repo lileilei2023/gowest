@@ -85,7 +85,7 @@ class DiscoveryTests(unittest.TestCase):
                 patch.object(launcher.platform,'system',return_value='Linux'), \
                 patch.object(launcher.os,'geteuid',return_value=0), \
                 patch.object(launcher.subprocess,'run'), patch.object(launcher,'dispatch') as dispatch, \
-                patch('builtins.input',side_effect=[str(Path(directory)/'params.json'),'','', '30Mbps',
+                patch('builtins.input',side_effect=[str(Path(directory)/'params.json'),'','', '30Mbps', '', '',
                     '1,2','sub.example.com','/root/fullchain.pem','/root/key.pem','HTTP','','INSTALL']):
             launcher.wizard()
             cfg=json.loads((Path(directory)/'params.json').read_text())

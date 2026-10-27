@@ -25,7 +25,7 @@ import network
 import hostfirewall
 import kit_runtime
 from installlog import InstallLog, redact
-from render import (dump, render, settings, SUBSCRIPTION_FILES,
+from render import (dump, render, settings, SUBSCRIPTION_FILES, account_dir, accounts, client_files, shape_mbps,
                     android_guide_text, desktop_guide_text, shadowrocket_guide_text, subscription_endpoints)
 
 HERE = Path(__file__).resolve().parent
@@ -151,6 +151,28 @@ def managed_file(s, target, content, mode=0o644, group=None):
         if group:
             os.fchown(f.fileno(), 0, grp.getgrnam(group).gr_gid)
         f.write(data)
+
+
+def replace_managed(s, target, content, mode=0o644, group=None):
+    """Atomically update a file this installer owns, refusing external edits."""
+    target = Path(target)
+    expected = s['files'].get(str(target))
+    if expected is None or target.is_symlink() or sha(target) != expected:
+        raise RuntimeError('Managed file changed externally; refusing update: ' + str(target))
+    data = content if isinstance(content, bytes) else content.encode()
+    tmp = target.with_name('.' + target.name + '.new')
+    with tmp.open('wb') as f:
+        os.fchmod(f.fileno(), mode)
+        if group:
+            os.fchown(f.fileno(), 0, grp.getgrnam(group).gr_gid)
+        f.write(data)
+    s['files'][str(target)] = hashlib.sha256(data).hexdigest()
+    save_state(s)
+    os.replace(tmp, target)
+
+
+def served_dir(user):
+    return CONFIG / 'subscriptions' / user if user else CONFIG / 'subscriptions'
 
 
 def os_release():
@@ -355,8 +377,18 @@ def verify(s):
     for proto in ('t', 'u'):
         if not run(['ss', '-H', '-ln' + proto, 'sport = :443']).stdout.strip():
             raise RuntimeError('Proxy listener missing')
+    for user in cfg['users'] or ['']:
+        verify_account(cfg, user)
+    # This is deliberately local validation, not a fabricated end-to-end throughput check.
+    report = network.verify_health(STATE / 'network.json')
+    for warning in report['warnings']:
+        print('Network warning: ' + warning, file=sys.stderr)
+
+
+def verify_account(cfg, user):
     sub = cfg['subscription']
-    urls = (STATE / 'generated/subscription-urls.txt').read_text().splitlines()
+    generated, served = STATE / 'generated' / account_dir(user), served_dir(user)
+    urls = (generated / 'subscription-urls.txt').read_text().splitlines()
     if len(urls) != 2 or not urls[0].startswith('normal: ') or not urls[1].startswith('strict: '):
         raise RuntimeError('Subscription URL manifest is incomplete or malformed')
     for row, name in zip(urls, ('normal.yaml', 'strict.yaml')):
@@ -365,9 +397,9 @@ def verify(s):
         request = f'url = "{url}"\nresolve = "{sub["host"]}:{sub["port"]}:127.0.0.1"\n'
         result = run(['curl', '--config', '-', '--noproxy', '*', '--fail', '--silent', '--show-error',
                       '--max-time', '20'], data=request, timeout=25)
-        if hashlib.sha256(result.stdout.encode()).hexdigest() != sha(CONFIG / 'subscriptions' / name):
+        if hashlib.sha256(result.stdout.encode()).hexdigest() != sha(served / name):
             raise RuntimeError('Served subscription does not match generated configuration')
-    extra = STATE / 'generated/client-urls.txt'
+    extra = generated / 'client-urls.txt'
     if extra.is_file():
         expected = {name for suffix, name in SUBSCRIPTION_FILES.items() if suffix not in ('', '-us')}
         entries = [row.split(': ', 1) for row in extra.read_text().splitlines()]
@@ -378,9 +410,9 @@ def verify(s):
             result = run(['curl', '--config', '-', '--noproxy', '*', '--fail', '--silent',
                           '--show-error', '--max-time', '20', '--max-filesize', '1048576'],
                          data=request, timeout=25)
-            if hashlib.sha256(result.stdout.encode()).hexdigest() != sha(CONFIG / 'subscriptions' / name):
+            if hashlib.sha256(result.stdout.encode()).hexdigest() != sha(served / name):
                 raise RuntimeError('Native client subscription response mismatch')
-    transports = STATE / 'generated/transport-urls.json'
+    transports = generated / 'transport-urls.json'
     if transports.is_file():
         entries = json.loads(transports.read_text())
         expected_endpoints = subscription_endpoints(cfg)
@@ -392,12 +424,8 @@ def verify(s):
                 result = run(['curl', '--config', '-', '--noproxy', '*', '--fail', '--silent',
                               '--show-error', '--max-time', '20', '--max-filesize', '1048576'],
                              data=request, timeout=25)
-                if hashlib.sha256(result.stdout.encode()).hexdigest() != sha(CONFIG / 'subscriptions' / name):
+                if hashlib.sha256(result.stdout.encode()).hexdigest() != sha(served / name):
                     raise RuntimeError('Subscription transport content mismatch')
-    # This is deliberately local validation, not a fabricated end-to-end throughput check.
-    report = network.verify_health(STATE / 'network.json')
-    for warning in report['warnings']:
-        print('Network warning: ' + warning, file=sys.stderr)
 
 
 def verify_started(s, timeout=30):
@@ -464,17 +492,21 @@ def install(cfg, confirm, firewall_mode='auto'):
                 managed_file(s, CONFIG / name, (out / name).read_bytes(), mode, group)
             s['files'].pop(str(CONFIG / 'subinfo.conf'))  # Stats intentionally change this file.
             save_state(s)
-            (CONFIG / 'subscriptions').mkdir(mode=0o750)
-            os.chmod(CONFIG / 'subscriptions', 0o750)
-            os.chown(CONFIG / 'subscriptions', 0, grp.getgrnam('www-data').gr_gid)
-            for name in SUBSCRIPTION_FILES.values():
-                managed_file(s, CONFIG / 'subscriptions' / name, (out / name).read_bytes(), 0o640, 'www-data')
+            for user in [''] + cfg['users']:
+                folder = served_dir(user)
+                folder.mkdir(mode=0o750)
+                os.chmod(folder, 0o750)
+                os.chown(folder, 0, grp.getgrnam('www-data').gr_gid)
+            for user in cfg['users'] or ['']:
+                for name in SUBSCRIPTION_FILES.values():
+                    managed_file(s, served_dir(user) / name, (out / account_dir(user) / name).read_bytes(),
+                                 0o640, 'www-data')
             if cfg['subscription']['scheme'] == 'https':
                 for key, name in [('certificate', 'subscription-fullchain.pem'), ('private_key', 'subscription-privkey.pem')]:
                     managed_file(s, CONFIG / name, Path(cfg['subscription'][key]).read_bytes(), 0o600)
             run([str(PROGRAM / 'bin/sing-box'), 'check', '-c', str(CONFIG / 'server.json')])
         with log.step(6, '应用保守网络配置并启动专属服务'):
-            net = network.apply(STATE / 'network.json')
+            net = network.apply(STATE / 'network.json', shape_mbps=shape_mbps(cfg))
             text = '# Managed by gowest; only explicit conservative parameters.\n'
             text += ''.join(k + ' = ' + v + '\n' for k, v in net['applied'].items())
             managed_file(s, SYSCTL, text)
@@ -566,13 +598,14 @@ def rollback(automatic=False):
     return archive
 
 
-def show_transports(transport, client):
+def show_transports(transport, client, user=''):
     cfg = settings(json.loads((CONFIG / 'settings.json').read_text()))
-    path = STATE / 'generated/transport-urls.json'
+    generated = STATE / 'generated' / account_dir(user)
+    path = generated / 'transport-urls.json'
     if path.is_file():
         entries = json.loads(path.read_text())
     else:
-        base = (STATE / 'generated/subscription-urls.txt').read_text().splitlines()[0].split(': ', 1)[1]
+        base = (generated / 'subscription-urls.txt').read_text().splitlines()[0].split(': ', 1)[1]
         entries = [dict(subscription_endpoints(cfg)[0], base=base)]
     selected = [entry for entry in entries if transport == 'all' or entry['scheme'] == transport]
     if not selected:
@@ -585,11 +618,61 @@ def show_transports(transport, client):
         if client in ('all', 'clash'):
             print('normal: ' + base + '\nstrict: ' + base + '-us')
         if client in ('all', 'mac', 'windows'):
-            print(desktop_guide_text(base, cfg['node_prefix']))
+            print(desktop_guide_text(base, cfg['node_prefix'], user))
         if client in ('all', 'android'):
-            print(android_guide_text(base, cfg['node_prefix']))
+            print(android_guide_text(base, cfg['node_prefix'], user))
         if client in ('all', 'shadowrocket'):
-            print(shadowrocket_guide_text(base, cfg['node_prefix']))
+            print(shadowrocket_guide_text(base, cfg['node_prefix'], user))
+
+
+def installed(confirm):
+    s = load_state()
+    if s['status'] != 'installed' or confirm != s['server_ip']:
+        raise RuntimeError('Confirm the installed server public IPv4 with --confirm-server')
+    path = CONFIG / 'settings.json'
+    if path.is_symlink() or sha(path) != s['files'].get(str(path)):
+        raise RuntimeError('Managed file changed externally; refusing update: ' + str(path))
+    return s, settings(json.loads(path.read_text()))
+
+
+def change_bandwidth(text, confirm):
+    """Re-target the plan bandwidth without touching keys or subscription URLs."""
+    import launcher
+    s, cfg = installed(confirm)
+    mbps = launcher.whole_mbps(text, '带宽')
+    cfg['hy2_up_mbps'] = cfg['hy2_down_mbps'] = mbps
+    cfg = settings(cfg)
+    if cfg['fair_share']:
+        # BBR clients carry no bandwidth, so only the shared queue rate changes.
+        if network.health(STATE / 'network.json')['fair_share']['result'] == 'applied':
+            network.set_rate(STATE / 'network.json', shape_mbps(cfg))
+            print(f'公平分配队列速率已改为 {shape_mbps(cfg)} Mbps（带宽的 95%），无需刷新订阅。')
+        else:
+            print('公平分配队列未生效，只更新记录的带宽；运行 status 查看原因。')
+    else:
+        # Single user with Brutal: the Hy2 targets live inside client profiles.
+        keys = json.loads((STATE / 'generated/secrets.json').read_text())
+        for account in accounts(cfg, keys):
+            for name, body in client_files(cfg, account).items():
+                replace_managed(s, served_dir(account['name']) / name, body, 0o640, 'www-data')
+        print(f'Hy2 目标已改为 {mbps} Mbps；订阅地址不变，请在各客户端“更新订阅”后生效。')
+    replace_managed(s, CONFIG / 'settings.json', dump(cfg), 0o600)
+
+
+def change_traffic(confirm, quota=None, metering=None, on_exceed=None):
+    from render import parse_bytes
+    s, cfg = installed(confirm)
+    if quota is not None:
+        cfg['traffic']['total_bytes'] = parse_bytes(quota)
+    if metering:
+        cfg['traffic']['metering'] = metering
+    if on_exceed:
+        cfg['traffic']['on_exceed'] = on_exceed
+    cfg = settings(cfg)
+    replace_managed(s, CONFIG / 'settings.json', dump(cfg), 0o600)
+    # Refresh the header and quota decision now instead of waiting five minutes.
+    run(['systemctl', 'start', 'la-vpn-subinfo.service'], check=False, timeout=60)
+    print(dump({'traffic': cfg['traffic']}))
 
 
 def main(argv=None):
@@ -614,6 +697,15 @@ def main(argv=None):
                       default='all',
                       help='clash = raw subscription links; mac/windows = Clash Verge Rev; '
                            'android = Clash Meta for Android; shadowrocket = iOS')
+    item.add_argument('--user', default='', help='多人共用时指定用户名')
+    item = sub.add_parser('bandwidth', help='调整套餐带宽；多人模式即时改公平队列速率')
+    item.add_argument('--set', required=True, help='如 30Mbps、1Gbps')
+    item.add_argument('--confirm-server', required=True)
+    item = sub.add_parser('traffic', help='调整每月流量上限、计量方式和超额动作')
+    item.add_argument('--quota', help='如 512GB、1TB；0 表示不设置')
+    item.add_argument('--metering', choices=('both', 'outbound'))
+    item.add_argument('--on-exceed', choices=('warn', 'stop'))
+    item.add_argument('--confirm-server', required=True)
     item = sub.add_parser('rollback')
     item.add_argument('--automatic', action='store_true', help=argparse.SUPPRESS)
     item = sub.add_parser('verify')
@@ -625,7 +717,13 @@ def main(argv=None):
                         'supported_os': 'Ubuntu 24.04 amd64/arm64 with systemd', 'sing_box_version': VERSION,
                         'ports': ['TCP 443', 'UDP 443'] + ['TCP ' + str(x['port']) for x in subscription_endpoints(cfg)],
                         'owned_roots': [str(CONFIG), str(PROGRAM), str(STATE)],
-                        'network': network.PARAMETERS, 'qdisc_policy': 'replace only default pfifo_fast; leave custom queues',
+                        'network': network.PARAMETERS,
+                        'qdisc_policy': ('fair-share CAKE on an untouched default root; custom queues left alone'
+                                         if cfg['fair_share'] else 'replace only default pfifo_fast; leave custom queues'),
+                        'users': cfg['users'] or ['(single)'], 'fair_share': cfg['fair_share'],
+                        'fair_share_rate_mbps': shape_mbps(cfg) or None,
+                        'monthly_quota_bytes': cfg['traffic']['total_bytes'] or None,
+                        'quota_metering': cfg['traffic']['metering'], 'on_exceed': cfg['traffic']['on_exceed'],
                         'fresh_host_required': True, 'firewall_changes': 'install: safe UFW additions only; no cloud changes',
                         'cloud_firewall': 'unverified; manual cloud-console confirmation required', 'client_changes': False,
                         'subscription_transports': [x['scheme'] for x in subscription_endpoints(cfg)]}))
@@ -647,6 +745,14 @@ def main(argv=None):
                 raise RuntimeError('Confirm the installed server public IPv4 before repair')
             network.repair_fq(STATE / 'network.json', args.adopt_default_fifo)
             print(dump(network.verify_health(STATE / 'network.json')))
+    elif args.command == 'bandwidth':
+        with exclusive_operation():
+            change_bandwidth(args.set, args.confirm_server)
+    elif args.command == 'traffic':
+        if args.quota is None and not args.metering and not args.on_exceed:
+            raise RuntimeError('请至少指定 --quota、--metering 或 --on-exceed')
+        with exclusive_operation():
+            change_traffic(args.confirm_server, args.quota, args.metering, args.on_exceed)
     elif args.command == 'verify':
         state = load_state()
         verify(state)
@@ -661,14 +767,24 @@ def main(argv=None):
         print(dump({'network': network.health(STATE / 'network.json')}))
         print(dump({'host_firewall': s.get('host_firewall', {}).get('report', 'not recorded'),
                     'cloud_firewall': 'unverified'}))
+        usage = STATE / 'traffic.json'
+        print(dump({'monthly_traffic': json.loads(usage.read_text()) if usage.is_file()
+                    else 'not measured yet (vnStat needs a few minutes)'}))
     elif args.command == 'urls':
         if load_state()['status'] != 'installed':
             raise RuntimeError('Deployment is not committed; subscription URLs are not ready')
+        users = settings(json.loads((CONFIG / 'settings.json').read_text()))['users']
+        user = args.user
+        if users and user not in users:
+            raise RuntimeError('多人模式请用 --user 指定其中一人：' + '、'.join(users))
+        if user and not users:
+            raise RuntimeError('此服务器是单人模式，不需要 --user')
+        generated = STATE / 'generated' / account_dir(user)
         print('Private subscription URLs — do not publish or include in shared logs:')
         if args.transport != 'primary':
-            show_transports(args.transport, args.client)
+            show_transports(args.transport, args.client, user)
             return
-        manifest = (STATE / 'generated/subscription-urls.txt').read_text()
+        manifest = (generated / 'subscription-urls.txt').read_text()
         if args.client in ('all', 'clash'):
             print(manifest, end='')
         if args.client in ('all', 'mac', 'windows', 'android'):
@@ -679,13 +795,13 @@ def main(argv=None):
             base = rows[0].split(': ', 1)[1]
             label = json.loads((CONFIG / 'settings.json').read_text()).get('node_prefix', 'LA')
             if args.client in ('all', 'mac', 'windows'):
-                print('\n' + desktop_guide_text(base, label), end='')
+                print('\n' + desktop_guide_text(base, label, user), end='')
             if args.client in ('all', 'android'):
-                print('\n' + android_guide_text(base, label), end='')
+                print('\n' + android_guide_text(base, label, user), end='')
         if args.client in ('all', 'shadowrocket'):
             print()
-            guide = STATE / 'generated/shadowrocket-import.txt'
-            extra = STATE / 'generated/client-urls.txt'
+            guide = generated / 'shadowrocket-import.txt'
+            extra = generated / 'client-urls.txt'
             if guide.is_file():
                 print(guide.read_text(), end='')
             elif extra.is_file():

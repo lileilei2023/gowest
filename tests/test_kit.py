@@ -296,7 +296,7 @@ class TransactionTests(unittest.TestCase):
         self.stack.enter_context(patch.object(vpn, 'verify_started', side_effect=lambda state: vpn.verify(state)))
         self.stack.enter_context(patch.object(vpn, 'download_binary', side_effect=lambda state:
                                              vpn.managed_file(state, vpn.PROGRAM / 'bin/sing-box', b'fake-executable', 0o755)))
-        def fake_network(path):
+        def fake_network(path, shape_mbps=0):
             snap = {'interface': 'ens3', 'before': {}, 'applied': {}, 'qdisc_before': {}, 'qdisc_changed': False}
             network.save(path, snap)
             return snap

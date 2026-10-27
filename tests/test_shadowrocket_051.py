@@ -77,6 +77,7 @@ class ShadowrocketTests(unittest.TestCase):
     def test_cli_shadowrocket_guide(self):
         stdout = io.StringIO()
         with patch.object(vpn, 'STATE', Path(self.temp.name)), \
+                patch.object(vpn, 'CONFIG', self.out), \
                 patch.object(vpn, 'load_state', return_value={'status': 'installed'}), \
                 patch.object(sys, 'argv', ['vpn.py', 'urls', '--client', 'shadowrocket']), \
                 contextlib.redirect_stdout(stdout):

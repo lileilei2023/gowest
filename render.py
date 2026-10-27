@@ -12,13 +12,14 @@ import re
 import secrets
 import subprocess
 import uuid
+from decimal import Decimal
 from urllib.parse import quote, urlencode
 
 import routing
 
 DOMAINS = routing.CLAUDE
 PROJECT_NAME = 'gowest'
-KIT_VERSION = '0.5.7'
+KIT_VERSION = '0.5.8'
 SELECT_GROUP = '出口选择'
 AUTO_GROUP = '自动回退'
 # Tailscale control plane stays direct on every Mihomo client:
@@ -27,6 +28,9 @@ TS_PROCESSES = ['tailscaled', 'Tailscale', 'io.tailscale.ipn.macsys.network-exte
                 'tailscaled.exe', 'tailscale-ipn.exe', 'com.tailscale.ipn']
 # Desktop client pinned by the clients/ installers; profiles use the same Mihomo YAML.
 DESKTOP_CLIENT = 'Clash Verge Rev 2.5.8'
+USER_NAME = r'[a-z][a-z0-9-]{0,15}'
+MAX_USERS = 32
+METERING = ('both', 'outbound')
 SUBSCRIPTION_FILES = {'': 'normal.yaml', '-us': 'strict.yaml', '-nodes': 'nodes.txt',
                       '-shadowrocket.conf': 'shadowrocket.conf',
                       '-us-shadowrocket.conf': 'shadowrocket-us.conf'}
@@ -67,7 +71,7 @@ def domain(value):
 def settings(raw):
     allowed = {'server_ip', 'node_prefix', 'hy2_up_mbps', 'hy2_down_mbps', 'ipv6',
                'tailnet', 'hosts', 'reality_server_name', 'hy2_server_name',
-               'subscription', 'traffic'}
+               'subscription', 'traffic', 'users', 'fair_share'}
     if set(raw) - allowed:
         raise ValueError('Unknown settings fields: ' + ', '.join(sorted(set(raw) - allowed)))
     s = copy.deepcopy(raw)
@@ -118,13 +122,60 @@ def settings(raw):
             if not isinstance(sub.get(key), str) or not Path(sub[key]).is_absolute():
                 raise ValueError('HTTPS requires absolute certificate/private_key paths')
     s.setdefault('traffic', {})
-    if set(s['traffic']) - {'total_bytes', 'expire_epoch'}:
+    if set(s['traffic']) - {'total_bytes', 'expire_epoch', 'metering', 'on_exceed'}:
         raise ValueError('Unknown traffic setting')
+    # total_bytes is the server's monthly quota (0 = not declared); it is shared
+    # by all users because the cloud plan meters the whole server.
     for key in ('total_bytes', 'expire_epoch'):
         value = s['traffic'].setdefault(key, 0)
         if type(value) is not int or value < 0:
             raise ValueError('Invalid traffic display value')
+    if s['traffic'].setdefault('metering', 'both') not in METERING:
+        raise ValueError('traffic.metering must be both or outbound')
+    if s['traffic'].setdefault('on_exceed', 'warn') not in ('warn', 'stop'):
+        raise ValueError('traffic.on_exceed must be warn or stop')
+    if s['traffic']['on_exceed'] == 'stop' and not s['traffic']['total_bytes']:
+        raise ValueError('on_exceed=stop requires a monthly quota (total_bytes)')
+    users = s.setdefault('users', [])
+    if (type(users) is not list or len(users) > MAX_USERS or len(set(users)) != len(users)
+            or not all(isinstance(u, str) and re.fullmatch(USER_NAME, u) for u in users)):
+        raise ValueError(f'users must be 1-{MAX_USERS} unique names matching {USER_NAME}')
+    # Several people sharing one server: Hy2 switches to BBR and the egress
+    # gets CAKE per-host fairness (idle capacity is borrowed, busy links split).
+    s.setdefault('fair_share', len(users) > 1)
+    if type(s['fair_share']) is not bool:
+        raise ValueError('fair_share must be boolean')
     return s
+
+
+def parse_bytes(text):
+    """'1TB', '512GB', '1.5TiB' -> bytes. GB/TB are decimal (as most cloud
+    plans bill); GiB/TiB are binary. Empty or 0 means no quota."""
+    value = str(text).strip().replace(' ', '')
+    if value in ('', '0'):
+        return 0
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)(GB|TB|GiB|TiB)', value, re.I)
+    if not match:
+        raise ValueError('流量上限请写成 512GB、1TB、1.5TB 或 1TiB 这样的形式')
+    units = {'gb': 10**9, 'tb': 10**12, 'gib': 2**30, 'tib': 2**40}
+    result = int(Decimal(match.group(1)) * units[match.group(2).lower()])
+    if result <= 0:
+        raise ValueError('流量上限必须大于 0')
+    return result
+
+
+def shape_mbps(s):
+    """CAKE rate: 95% of the plan so queues form here, not in the cloud shaper."""
+    return max(1, int(s['hy2_down_mbps'] * 95 // 100)) if s['fair_share'] else 0
+
+
+def accounts(s, k):
+    """Per-user credentials merged with the shared server keys.
+
+    Without named users this is the legacy single account (flat file layout)."""
+    if not s['users']:
+        return [dict(k, name='')]
+    return [dict(k, **user) for user in k['users']]
 
 
 def make_secrets(out, s):
@@ -142,24 +193,36 @@ def make_secrets(out, s):
          '-keyout', str(out / 'hy2.key'), '-out', str(out / 'hy2.crt')])
     os.chmod(out / 'hy2.key', 0o600)
     der = run(['x509', '-in', str(out / 'hy2.crt'), '-outform', 'DER'])
-    return {'uuid': str(uuid.uuid4()), 'reality_private_key': b64(private_der[-32:]),
-            'reality_public_key': b64(public_der[-32:]), 'short_id': secrets.token_hex(8),
-            'hy2_password': secrets.token_urlsafe(32), 'obfs_password': secrets.token_urlsafe(32),
-            'subscription_token': secrets.token_hex(24), 'certificate_fingerprint': hashlib.sha256(der).hexdigest()}
+    k = {'reality_private_key': b64(private_der[-32:]),
+         'reality_public_key': b64(public_der[-32:]), 'short_id': secrets.token_hex(8),
+         'obfs_password': secrets.token_urlsafe(32), 'certificate_fingerprint': hashlib.sha256(der).hexdigest()}
+    user = lambda: {'uuid': str(uuid.uuid4()), 'hy2_password': secrets.token_urlsafe(32),
+                    'subscription_token': secrets.token_hex(24)}
+    if s['users']:
+        # Each person gets independent credentials and a private subscription
+        # token, so one link can be revoked or leak without exposing others.
+        k['users'] = [dict(user(), name=name) for name in s['users']]
+    else:
+        k.update(user())
+    return k
 
 
 def server_config(s, k):
+    named = lambda a, extra: dict({'name': a['name']} if a['name'] else {}, **extra)
+    users = accounts(s, k)
     return {'log': {'level': 'warn'}, 'inbounds': [
         {'type': 'vless', 'tag': 'vless-in', 'listen': '::', 'listen_port': 443,
-         'users': [{'uuid': k['uuid'], 'flow': 'xtls-rprx-vision'}],
+         'users': [named(a, {'uuid': a['uuid'], 'flow': 'xtls-rprx-vision'}) for a in users],
          'tls': {'enabled': True, 'server_name': s['reality_server_name'],
                  'reality': {'enabled': True,
                              'handshake': {'server': s['reality_server_name'], 'server_port': 443},
                              'private_key': k['reality_private_key'], 'short_id': [k['short_id']]}}},
         {'type': 'hysteria2', 'tag': 'hy2-in', 'listen': '::', 'listen_port': 443,
-         'users': [{'password': k['hy2_password']}],
+         'users': [named(a, {'password': a['hy2_password']}) for a in users],
          'obfs': {'type': 'salamander', 'password': k['obfs_password']},
-         'ignore_client_bandwidth': False,
+         # Shared servers: clients are told to use BBR instead of fixed-rate
+         # Brutal, which would ignore the fair-share queue and starve others.
+         'ignore_client_bandwidth': s['fair_share'],
          'tls': {'enabled': True, 'alpn': ['h3'], 'certificate_path': '/etc/la-vpn/hy2.crt',
                  'key_path': '/etc/la-vpn/hy2.key'}}], 'outbounds': [{'type': 'direct'}]}
 
@@ -216,7 +279,8 @@ def client_config(s, k, strict=False):
                  'password': k['hy2_password'], 'obfs': 'salamander', 'obfs-password': k['obfs_password'],
                  'sni': s['hy2_server_name'], 'alpn': ['h3'], 'skip-cert-verify': True,
                  'fingerprint': k['certificate_fingerprint'],
-                 'up': f"{int(s['hy2_up_mbps'])} Mbps", 'down': f"{int(s['hy2_down_mbps'])} Mbps"}],
+                 **({} if s['fair_share'] else
+                    {'up': f"{int(s['hy2_up_mbps'])} Mbps", 'down': f"{int(s['hy2_down_mbps'])} Mbps"})}],
             'proxy-groups': [{'name': select, 'type': 'select',
                               'proxies': [auto, hy, vl] + ([] if strict else ['DIRECT']),
                               'default-selected': auto}, group(auto),
@@ -375,11 +439,15 @@ def transport_manifest(s, k):
 
 def shadowrocket_import_guide(s, k):
     """Private, server-specific copy/paste instructions; never served by nginx."""
-    return shadowrocket_guide_text(subscription_base(s, k), s['node_prefix'])
+    return shadowrocket_guide_text(subscription_base(s, k), s['node_prefix'], k.get('name', ''))
 
 
-def shadowrocket_guide_text(base, label):
-    return f'''{label} 小火箭导入说明（{PROJECT_NAME} {KIT_VERSION}）— 含私密订阅入口，请勿公开
+def owner(user):
+    return f'（用户 {user}）' if user else ''
+
+
+def shadowrocket_guide_text(base, label, user=''):
+    return f'''{label} 小火箭导入说明{owner(user)}（{PROJECT_NAME} {KIT_VERSION}）— 含私密订阅入口，请勿公开
 
 1. 节点订阅： 首页 → ＋ → 类型 Subscribe → 粘贴以下完整网址 → 保存。
 {base}-nodes
@@ -410,8 +478,9 @@ VPN 开关、全局路由、首页节点、场景和应用级回退不能靠导�
 '''
 
 
-def profile_names(label):
-    return {'normal': PROJECT_NAME + '-' + label + '-日常', 'strict': PROJECT_NAME + '-' + label + '-全公网'}
+def profile_names(label, user=''):
+    stem = PROJECT_NAME + '-' + label + ('-' + user if user else '')
+    return {'normal': stem + '-日常', 'strict': stem + '-全公网'}
 
 
 def install_link(scheme, base, name):
@@ -420,9 +489,9 @@ def install_link(scheme, base, name):
     return f"{scheme}://install-config?name={quote(name, safe='')}&url={quote(base, safe='')}"
 
 
-def desktop_guide_text(base, label):
-    names = profile_names(label)
-    return f'''{label} Mac / Windows 导入说明（{PROJECT_NAME} {KIT_VERSION}，{DESKTOP_CLIENT}）— 含私密订阅入口，请勿公开
+def desktop_guide_text(base, label, user=''):
+    names = profile_names(label, user)
+    return f'''{label} Mac / Windows 导入说明{owner(user)}（{PROJECT_NAME} {KIT_VERSION}，{DESKTOP_CLIENT}）— 含私密订阅入口，请勿公开
 
 日常分流订阅（国内直连）：
 {base}
@@ -444,9 +513,9 @@ Windows：双击 clients/windows/gowest-client.cmd），按提示粘贴上面的
 '''
 
 
-def android_guide_text(base, label):
-    names = profile_names(label)
-    return f'''{label} Android 导入说明（{PROJECT_NAME} {KIT_VERSION}，Clash Meta for Android）— 含私密订阅入口，请勿公开
+def android_guide_text(base, label, user=''):
+    names = profile_names(label, user)
+    return f'''{label} Android 导入说明{owner(user)}（{PROJECT_NAME} {KIT_VERSION}，Clash Meta for Android）— 含私密订阅入口，请勿公开
 
 在手机浏览器打开下面的链接，会唤起 CMFA 的“新配置”页面并填好地址：
 日常分流：{install_link('clashmeta', base, names['normal'])}
@@ -460,10 +529,10 @@ Android 同一时间只能运行一个 VPN：与 Tailscale 等 VPN 应用互斥�
 '''
 
 
-def client_import_guide_text(base, label):
+def client_import_guide_text(base, label, user=''):
     """All four clients in one private file; served by nothing, printed by `urls`."""
-    return '\n'.join([desktop_guide_text(base, label), android_guide_text(base, label),
-                      shadowrocket_guide_text(base, label)])
+    return '\n'.join([desktop_guide_text(base, label, user), android_guide_text(base, label, user),
+                      shadowrocket_guide_text(base, label, user)])
 
 
 def client_files(s, k):
@@ -500,17 +569,41 @@ http {
         ssl_certificate_key /etc/la-vpn/subscription-privkey.pem;
         ssl_protocols TLSv1.2 TLSv1.3;
 '''
-    for suffix, file in SUBSCRIPTION_FILES.items():
-        text += f'''        location = /sub/{k['subscription_token']}{suffix} {{
-            alias /etc/la-vpn/subscriptions/{file};
+    for a in accounts(s, k):
+        folder = a['name'] + '/' if a['name'] else ''
+        label = s['node_prefix'] + ('-' + a['name'] if a['name'] else '')
+        for suffix, file in SUBSCRIPTION_FILES.items():
+            text += f'''        location = /sub/{a['subscription_token']}{suffix} {{
+            alias /etc/la-vpn/subscriptions/{folder}{file};
             default_type {'text/yaml' if file.endswith('.yaml') else 'text/plain'};
             include /etc/la-vpn/subinfo.conf;
             add_header profile-update-interval 24 always;
-            add_header Content-Disposition 'attachment; filename="{s['node_prefix']}-{file}"' always;
+            add_header Content-Disposition 'attachment; filename="{label}-{file}"' always;
             add_header Cache-Control "no-store" always;
         }}
 '''
     return text + '        location / { return 404; }\n    }\n}\n'
+
+
+def account_dir(name):
+    """Legacy single user keeps the flat layout; named users get users/<name>/."""
+    return Path('users') / name if name else Path('.')
+
+
+def write_account(target, s, a):
+    for name, body in client_files(s, a).items():
+        write(target / name, body)
+    base = subscription_base(s, a)
+    label, user = s['node_prefix'], a['name']
+    write(target / 'subscription-urls.txt', 'normal: ' + base + '\nstrict: ' + base + '-us\n')
+    write(target / 'client-urls.txt', ''.join(name + ': ' + base + suffix + '\n'
+          for suffix, name in SUBSCRIPTION_FILES.items() if suffix not in ('', '-us')))
+    write(target / 'shadowrocket-import.txt', shadowrocket_import_guide(s, a))
+    write(target / 'client-import.txt', client_import_guide_text(base, label, user))
+    write(target / 'transport-urls.json', dump(transport_manifest(s, a)))
+    write(target / 'transport-import.txt', '\n'.join(
+        item['scheme'].upper() + ' 订阅入口\n' + client_import_guide_text(item['base'], label, user)
+        for item in transport_manifest(s, a)))
 
 
 def render(raw, directory):
@@ -523,20 +616,12 @@ def render(raw, directory):
     write(out / 'secrets.json', dump(k))
     write(out / 'settings.json', dump(s))
     write(out / 'server.json', dump(server_config(s, k)))
-    for name, body in client_files(s, k).items():
-        write(out / name, body)
     write(out / 'nginx.conf', nginx_config(s, k))
     write(out / 'subinfo.conf', '# Populated by optional vnStat display timer.\n')
-    base = subscription_base(s, k)
-    write(out / 'subscription-urls.txt', 'normal: ' + base + '\nstrict: ' + base + '-us\n')
-    write(out / 'client-urls.txt', ''.join(name + ': ' + base + suffix + '\n'
-          for suffix, name in SUBSCRIPTION_FILES.items() if suffix not in ('', '-us')))
-    write(out / 'shadowrocket-import.txt', shadowrocket_import_guide(s, k))
-    write(out / 'client-import.txt', client_import_guide_text(base, s['node_prefix']))
-    write(out / 'transport-urls.json', dump(transport_manifest(s, k)))
-    write(out / 'transport-import.txt', '\n'.join(
-        item['scheme'].upper() + ' 订阅入口\n' + client_import_guide_text(item['base'], s['node_prefix'])
-        for item in transport_manifest(s, k)))
+    for a in accounts(s, k):
+        write_account(out / account_dir(a['name']), s, a)
+    if s['users']:
+        write(out / 'users.json', dump(s['users']))
     if s['tailnet']:
         write(out / 'tailnet-resolver.conf', 'nameserver 100.100.100.100\n')
     return out

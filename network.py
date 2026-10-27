@@ -9,6 +9,11 @@ import tempfile
 PRIOMAP = [1, 2, 2, 2, 1, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1]
 FQ_HANDLE = '1af0:'
 RESTORED_HANDLE = '1af1:'
+CAKE_HANDLE = '1af2:'
+# Kernel-created defaults only (handle 0:). Deleting such a root lets the kernel
+# recreate exactly this default, which is what makes CAKE removal reversible.
+DEFAULT_ROOTS = {'pfifo_fast', 'fq_codel', 'fq', 'mq', 'noqueue'}
+DEFAULT_CHILDREN = {'pfifo_fast', 'fq_codel', 'fq'}
 STATE_PATH = Path('/var/lib/la-vpn-deploy/network.json')
 ARCHIVES = Path('/var/lib/la-vpn-archives')
 
@@ -54,7 +59,12 @@ def identity(q):
 
 def topology(dev):
     rows = json.loads(run('tc', '-j', 'qdisc', 'show', 'dev', dev) or '[]')
-    classes = json.loads(run('tc', '-j', 'class', 'show', 'dev', dev) or '[]')
+    try:
+        classes = json.loads(run('tc', '-j', 'class', 'show', 'dev', dev) or '[]')
+    except ValueError:
+        # iproute2 emits malformed JSON for CAKE's per-flow classes under load;
+        # unknown classes are treated as present, never as an isolated root.
+        classes = [{'unparsed': True}]
     filters = json.loads(run('tc', '-j', 'filter', 'show', 'dev', dev, 'root') or '[]')
     roots = [q for q in rows if q.get('root')]
     return {'root': roots[0] if len(roots) == 1 else {},
@@ -104,6 +114,80 @@ def rollback_receipt(dev, q):
     return False
 
 
+def pristine(dev):
+    """Root and every child are untouched kernel defaults, with no filters."""
+    rows = json.loads(run('tc', '-j', 'qdisc', 'show', 'dev', dev) or '[]')
+    filters = json.loads(run('tc', '-j', 'filter', 'show', 'dev', dev, 'root') or '[]')
+    roots = [q for q in rows if q.get('root')]
+    if len(roots) != 1 or filters or any(q.get('handle') != '0:' for q in rows):
+        return None
+    if roots[0].get('kind') not in DEFAULT_ROOTS:
+        return None
+    if any(q.get('kind') not in DEFAULT_CHILDREN for q in rows if not q.get('root')):
+        return None
+    return roots[0]
+
+
+def cake(dev, mbps, verb='replace'):
+    # dual-dsthost: share first per destination host (each client device on the
+    # download path), then per flow; idle capacity is always borrowed.
+    run('tc', 'qdisc', verb, 'dev', dev, 'root', 'handle', CAKE_HANDLE,
+        'cake', 'bandwidth', f'{int(mbps)}mbit', 'dual-dsthost')
+
+
+def owned_cake(q, shaping):
+    return (q.get('kind') == 'cake' and q.get('handle') == CAKE_HANDLE
+            and identity(q) == identity(shaping.get('cake') or {}))
+
+
+def shape(state_path, state, mbps):
+    """Fair-share CAKE on a pristine default root; otherwise leave it and report."""
+    dev = state['interface']
+    root = pristine(dev)
+    state['shaping'] = {'rate_mbps': int(mbps), 'cake': None, 'boot_id': boot_id()}
+    if root is None:
+        state['shaping']['result'] = 'skipped-custom-queue'
+        save(state_path, state)
+        return False
+    run('modprobe', 'sch_cake', check=False)
+    state['shaping'].update(before=identity(root), result='applying')
+    save(state_path, state)
+    try:
+        cake(dev, mbps)
+    except RuntimeError:
+        # Kernel without sch_cake: the root is untouched, fall back to FQ rules.
+        if pristine(dev) is None:
+            raise RuntimeError('CAKE failed and the root queue changed; manual review required')
+        state['shaping']['result'] = 'cake-unavailable'
+        save(state_path, state)
+        return False
+    q = root_qdisc(dev)
+    if q.get('kind') != 'cake' or q.get('handle') != CAKE_HANDLE:
+        raise RuntimeError('CAKE did not take effect; snapshot retained for recovery')
+    state['shaping'].update(cake=q, result='applied')
+    state['qdisc_result'] = 'cake-fair-share'
+    save(state_path, state)
+    return True
+
+
+def set_rate(state_path, mbps):
+    """Change the fair-share rate in place; the queue and its flows are kept."""
+    state = json.loads(Path(state_path).read_text())
+    shaping = state.get('shaping') or {}
+    if shaping.get('result') != 'applied':
+        raise RuntimeError('Fair-share CAKE is not active on this server')
+    q = root_qdisc(state['interface'])
+    if not owned_cake(q, shaping):
+        raise RuntimeError('Managed CAKE changed outside this installer; refusing rate change')
+    cake(state['interface'], mbps, 'change')
+    q = root_qdisc(state['interface'])
+    if q.get('kind') != 'cake' or q.get('handle') != CAKE_HANDLE:
+        raise RuntimeError('CAKE rate change verification failed')
+    shaping.update(rate_mbps=int(mbps), cake=q)
+    save(state_path, state)
+    return state
+
+
 def set_fq(state_path, state, before):
     actual = topology(state['interface'])
     if not actual['isolated'] or identity(actual['root']) != identity(before):
@@ -122,7 +206,7 @@ def set_fq(state_path, state, before):
     return state
 
 
-def apply(state_path):
+def apply(state_path, shape_mbps=0):
     if Path(state_path).exists():
         raise RuntimeError('Network snapshot already exists; refusing repeat tuning')
     dev = interface()
@@ -146,6 +230,8 @@ def apply(state_path):
         state['applied'][key] = value
         save(state_path, state)
         run('sysctl', '-w', key + '=' + value)
+    if shape_mbps and shape(state_path, state, shape_mbps):
+        return state
     if layout['isolated'] and safe_pfifofast(q, allow_nonzero=approved):
         set_fq(state_path, state, q)
     return state
@@ -156,6 +242,13 @@ def check_restore(state):
         value = run('sysctl', '-n', key)
         if value not in (target, state['before'][key]):
             raise RuntimeError('Network parameter changed outside this installer: ' + key)
+    shaping = state.get('shaping') or {}
+    if shaping.get('result') in ('applied', 'applying'):
+        q = root_qdisc(state['interface'])
+        ours = owned_cake(q, shaping) or (shaping['result'] == 'applying'
+                                          and q.get('kind') == 'cake' and q.get('handle') == CAKE_HANDLE)
+        if not ours and pristine(state['interface']) is None:
+            raise RuntimeError('Fair-share queue changed outside installer; manual review required')
     if state['qdisc_changed']:
         if not safe_pfifofast(state['qdisc_before'], allow_nonzero=True):
             raise RuntimeError('Cannot safely restore non-default FIFO')
@@ -179,6 +272,17 @@ def restore(state_path):
     check_restore(state)
     for key in state['applied']:
         run('sysctl', '-w', key + '=' + state['before'][key])
+    shaping = state.get('shaping') or {}
+    if shaping.get('result') in ('applied', 'applying'):
+        # Sysctls (default_qdisc) are restored first, so deleting the managed root
+        # lets the kernel recreate the original default queue.
+        q = root_qdisc(state['interface'])
+        if q.get('kind') == 'cake' and q.get('handle') == CAKE_HANDLE:
+            run('tc', 'qdisc', 'del', 'dev', state['interface'], 'root')
+        if pristine(state['interface']) is None:
+            raise RuntimeError('Default queue was not restored after removing CAKE')
+        shaping['result'] = 'restored'
+        save(state_path, state)
     if state['qdisc_changed']:
         before = state['qdisc_before']
         if not safe_pfifofast(before, allow_nonzero=True):
@@ -202,6 +306,8 @@ def restore(state_path):
 def repair_fq(state_path, adopt_default_fifo=False):
     """Explicit repair of a skipped legacy FIFO; no sysctls/subscriptions changed."""
     state = json.loads(Path(state_path).read_text())
+    if (state.get('shaping') or {}).get('result') == 'applied':
+        raise RuntimeError('Fair-share CAKE manages this queue; FQ repair does not apply')
     layout = topology(state['interface'])
     q = layout['root']
     if state.get('qdisc_changed'):
@@ -222,6 +328,17 @@ def boot_fq(dev, state_path=STATE_PATH):
     state = json.loads(Path(state_path).read_text())
     if state['interface'] != dev:
         raise RuntimeError('Interface does not match network snapshot')
+    shaping = state.get('shaping') or {}
+    if shaping.get('result') == 'applied':
+        q = root_qdisc(dev)
+        # A reboot drops tc state; reapply only onto an untouched default root.
+        if not owned_cake(q, shaping) and pristine(dev) is not None:
+            cake(dev, shaping['rate_mbps'])
+            q = root_qdisc(dev)
+            if q.get('kind') == 'cake' and q.get('handle') == CAKE_HANDLE:
+                shaping.update(cake=q, boot_id=boot_id())
+                save(state_path, state)
+        return health(state_path)
     layout = topology(dev)
     q = layout['root']
     if q.get('kind') == 'fq':
@@ -250,8 +367,15 @@ def health(state_path):
     cc = run('sysctl', '-n', 'net.ipv4.tcp_congestion_control', check=False) or 'unavailable'
     default = run('sysctl', '-n', 'net.core.default_qdisc', check=False) or 'unavailable'
     fq = q.get('kind') == 'fq'
+    shaping = state.get('shaping') or {}
+    shaped = shaping.get('result') == 'applied'
+    cake_ok = shaped and owned_cake(q, shaping)
     warnings = []
-    if not fq:
+    if shaped and not cake_ok:
+        warnings.append('Managed fair-share CAKE missing or modified; users are no longer isolated')
+    elif shaping.get('result') in ('skipped-custom-queue', 'cake-unavailable'):
+        warnings.append('Fair share requested but not applied (' + shaping['result'] + '); flows still share via the default queue')
+    if not fq and not cake_ok:
         warnings.append('Actual root is not FQ; sysctl/default_qdisc or active service does not prove FQ')
     if cc != 'bbr':
         warnings.append('Linux TCP BBR is not active (Hy2 has independent QUIC congestion control)')
@@ -265,6 +389,8 @@ def health(state_path):
     return {'interface': state['interface'], 'actual_root_qdisc': identity(q),
             'isolated_root': layout['isolated'], 'fq_effective': fq,
             'managed_fq_matches': owned_ok if state.get('qdisc_changed') else None,
+            'fair_share': {'result': shaping.get('result', 'not-requested'),
+                           'rate_mbps': shaping.get('rate_mbps'), 'cake_matches': cake_ok if shaped else None},
             'tcp_congestion_control': cc, 'default_qdisc': default,
             'last_action': state.get('qdisc_result', 'legacy-snapshot'), 'warnings': warnings}
 
@@ -273,6 +399,8 @@ def verify_health(state_path):
     report = health(state_path)
     if report['managed_fq_matches'] is False:
         raise RuntimeError('Managed FQ verification failed; inspect network status')
+    if report['fair_share']['cake_matches'] is False:
+        raise RuntimeError('Managed fair-share CAKE verification failed; inspect network status')
     return report
 
 

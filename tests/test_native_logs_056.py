@@ -52,7 +52,7 @@ class Defaults056Tests(unittest.TestCase):
                 patch.object(launcher.os, 'geteuid', return_value=0), \
                 patch.object(launcher.subprocess, 'run'), patch.object(launcher, 'dispatch') as dispatch:
             path = Path(temporary) / 'config.json'
-            with patch('builtins.input', side_effect=[str(path), '', '', '1Gbps', '', 'HTTP', '', '']) as ask:
+            with patch('builtins.input', side_effect=[str(path), '', '', '1Gbps', '', '', '', 'HTTP', '', '']) as ask:
                 launcher.wizard()
             cfg = json.loads(path.read_text())
             self.assertEqual(cfg['subscription']['scheme'], 'http')
