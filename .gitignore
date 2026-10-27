@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+runtime*/
+generated*/
+settings.local.json
+firewall.local.json
+firewall.bootstrap.json
+*.tar.gz
+dist/
+.DS_Store
+._*
+*.key
+secrets.json

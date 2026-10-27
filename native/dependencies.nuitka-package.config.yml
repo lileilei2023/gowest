@@ -1,0 +1,12 @@
+- module-name: '_ssl'
+  import-hacks:
+    - package-system-dlls: 'yes'
+- module-name: '_hashlib'
+  import-hacks:
+    - package-system-dlls: 'yes'
+- module-name: '_lzma'
+  import-hacks:
+    - package-system-dlls: 'yes'
+- module-name: 'yaml._yaml'
+  import-hacks:
+    - package-system-dlls: 'yes'

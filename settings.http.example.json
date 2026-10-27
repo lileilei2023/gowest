@@ -1,0 +1,16 @@
+{
+  "server_ip": "192.0.2.10",
+  "node_prefix": "LA",
+  "hy2_up_mbps": 10,
+  "hy2_down_mbps": 30,
+  "ipv6": true,
+  "tailnet": "",
+  "hosts": {},
+  "subscription": {
+    "scheme": "http",
+    "host": "192.0.2.10",
+    "port": 80,
+    "allow_insecure_http": true
+  },
+  "traffic": {"total_bytes": 0, "expire_epoch": 0}
+}

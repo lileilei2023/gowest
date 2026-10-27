@@ -1,0 +1,5 @@
+# Maintainer only. End users of native releases do not install these.
+Nuitka==4.3.1
+PyYAML==6.0.3
+ordered-set==4.1.0
+zstandard==0.25.0
