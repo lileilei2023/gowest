@@ -23,6 +23,11 @@ def settings(https=False):
     return json.loads((ROOT / name).read_text())
 
 
+def new_install(https=False):
+    """What a fresh install defaults to: port hopping plus the TUIC/AnyTLS fallbacks."""
+    return dict(settings(https), extra_protocols=['tuic', 'anytls'], port_hopping=True)
+
+
 class FirewallTests(unittest.TestCase):
     def test_http_ports_and_exact_schema(self):
         rules = firewall.generate(settings(), ['198.51.100.7/32'])
@@ -40,7 +45,26 @@ class FirewallTests(unittest.TestCase):
                             (True, 'Firewall-Rule-Template-https-json.json')]:
             with self.subTest(https=https):
                 document = json.loads((ROOT / 'firewall' / name).read_text())
-                self.assertEqual(document, firewall.generate(settings(https), allow_world_ssh=True))
+                self.assertEqual(document, firewall.generate(new_install(https), allow_world_ssh=True))
+
+    def test_multi_user_template_covers_every_port_of_32_urls(self):
+        document = json.loads((ROOT / 'firewall/Firewall-Rule-Template-multi-json.json').read_text())
+        ranges = {}
+        for row in document['data']:
+            self.assertEqual(set(row), firewall.FIELDS)
+            proto, _, ports = row['协议及端口'].partition(':')
+            first, _, last = ports.partition('-')
+            if ports:
+                ranges.setdefault(proto, []).append((int(first), int(last or first)))
+        cfg = dict(new_install(), users=[f'u{i}' for i in range(1, 33)])
+        cfg.pop('fair_share', None)
+        for rule in firewall.expected_ports(cfg):
+            if rule == 'ICMP':
+                continue
+            proto, _, ports = rule.partition(':')
+            first, _, last = ports.partition('-')
+            covered = any(a <= int(first) and int(last or first) <= b for a, b in ranges.get(proto, []))
+            self.assertTrue(covered, rule)
 
     def test_https_and_custom_subscription_ports(self):
         for port in (8443, 9443, 8080):
@@ -130,7 +154,11 @@ class FirewallTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), original)
 
     def test_launcher_firewall_exit_code(self):
-        args = ['check', '--settings', str(ROOT / 'settings.http.example.json'),
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        fresh = Path(directory.name) / 'settings.json'
+        fresh.write_text(json.dumps(new_install()))
+        args = ['check', '--settings', str(fresh),
                 '--file', str(ROOT / 'firewall/Firewall-Rule-Template-json.json')]
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exc:
             launcher.main(['firewall'] + args)
