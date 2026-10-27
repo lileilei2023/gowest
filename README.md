@@ -15,6 +15,7 @@
   <a href="#-快速开始">快速开始</a> ·
   <a href="#-效果预览">效果预览</a> ·
   <a href="#-架构">架构</a> ·
+  <a href="#-客户端下载与导入">客户端下载</a> ·
   <a href="#-使用场景">使用场景</a> ·
   <a href="docs/详细说明.md">详细说明</a> ·
   <a href="docs/快速部署.md">快速部署</a> ·
@@ -123,21 +124,29 @@ python3 -B probe.py --proxy http://127.0.0.1:7897 --expect-exit-ip <新服务器
 
 </details>
 
-## 🎯 使用场景
+## 📥 客户端下载与导入
 
-两份订阅加上客户端开关，可以组合出四种常用场景：
+Mac / Windows 用户可以直接运行 `clients/` 里的一键脚本：脚本会下载下表中的同一版本，校验 SHA-256，然后导入订阅。想手动安装时，从下表的官方地址下载：
 
-<p align="center"><img src="docs/images/scenes.png" alt="四种使用场景" width="100%"></p>
+| 平台 | 客户端 | 下载（官方来源） | 导入方式 |
+| --- | --- | --- | --- |
+| macOS（Apple 芯片） | Clash Verge Rev 2.5.8 | [Clash.Verge_2.5.8_aarch64.dmg](https://github.com/clash-verge-rev/clash-verge-rev/releases/download/v2.5.8/Clash.Verge_2.5.8_aarch64.dmg) | 一键脚本 `clients/macos/gowest-client.command`，或打开 `urls --client mac` 输出的 `clash://` 链接 |
+| macOS（Intel） | Clash Verge Rev 2.5.8 | [Clash.Verge_2.5.8_x64.dmg](https://github.com/clash-verge-rev/clash-verge-rev/releases/download/v2.5.8/Clash.Verge_2.5.8_x64.dmg) | 同上 |
+| Windows（x64） | Clash Verge Rev 2.5.8 | [Clash.Verge_2.5.8_x64-setup.exe](https://github.com/clash-verge-rev/clash-verge-rev/releases/download/v2.5.8/Clash.Verge_2.5.8_x64-setup.exe) | 一键脚本 `clients/windows/gowest-client.cmd`，或 `urls --client windows` 输出的 `clash://` 链接 |
+| Windows（ARM64） | Clash Verge Rev 2.5.8 | [Clash.Verge_2.5.8_arm64-setup.exe](https://github.com/clash-verge-rev/clash-verge-rev/releases/download/v2.5.8/Clash.Verge_2.5.8_arm64-setup.exe) | 同上 |
+| Android | Clash Meta for Android | [GitHub Releases](https://github.com/MetaCubeX/ClashMetaForAndroid/releases/latest)：大多数手机选 `cmfa-*-meta-arm64-v8a-release.apk`，不确定时选 `universal` | 在手机浏览器中打开 `urls --client android` 输出的 `clashmeta://` 链接 |
+| iOS | Shadowrocket（付费） | [App Store](https://apps.apple.com/us/app/shadowrocket/id932747118)（中国大陆区未上架，需要使用其他地区的 Apple ID） | 节点订阅 `-nodes`，加上 `-shadowrocket.conf` 或 `-us-shadowrocket.conf`，见 [小火箭使用指南](docs/小火箭使用指南.md) |
 
-| 平台 | 客户端 | 导入方式 |
-| --- | --- | --- |
-| macOS | Clash Verge Rev | `clients/macos/gowest-client.command` 一键脚本，或 `clash://` 链接 |
-| Windows | Clash Verge Rev | `clients/windows/gowest-client.cmd` 一键脚本，或 `clash://` 链接 |
-| Android | Clash Meta for Android | 在手机浏览器中打开 `clashmeta://` 链接 |
-| iOS | Shadowrocket | 节点订阅 + `-shadowrocket.conf` / `-us-shadowrocket.conf` |
+其他版本见 [Clash Verge Rev Releases](https://github.com/clash-verge-rev/clash-verge-rev/releases)。一键脚本锁定的是 2.5.8；如果你手动装了更新的版本，脚本会把它视为已安装，不会降级。
 
 > [!WARNING]
-> Clash for Windows 和旧版 Clash for Android 的内核不支持 VLESS+REALITY 和 Hysteria2，无法使用。桌面四种场景见 [桌面使用指南](docs/桌面使用指南.md)，手机端见 [小火箭使用指南](docs/小火箭使用指南.md)。
+> Clash for Windows、ClashX 和旧版 Clash for Android 的内核不支持 VLESS+REALITY 和 Hysteria2，无法使用。请只从上面的官方来源下载，不要用来路不明的"破解版"或镜像站安装包。
+
+## 🎯 使用场景
+
+两份订阅加上客户端开关，可以组合出四种常用场景（详见 [桌面使用指南](docs/桌面使用指南.md)）：
+
+<p align="center"><img src="docs/images/scenes.png" alt="四种使用场景" width="100%"></p>
 
 ## 📂 项目结构
 
