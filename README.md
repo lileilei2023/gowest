@@ -3,16 +3,16 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.8.1-6366f1">
+  <img alt="version" src="https://img.shields.io/badge/version-0.8.2-6366f1">
   <img alt="platform" src="https://img.shields.io/badge/server-Ubuntu%2024.04%20amd64%20%7C%20arm64-e95420">
   <img alt="sing-box" src="https://img.shields.io/badge/sing--box-1.14.3-0ea5e9">
-  <img alt="tests" src="https://img.shields.io/badge/tests-272%20passed-22c55e">
+  <img alt="tests" src="https://img.shields.io/badge/tests-274%20passed-22c55e">
   <img alt="clients" src="https://img.shields.io/badge/clients-macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-64748b">
 </p>
 
 <p align="center">
   <a href="#-快速开始">快速开始</a> ·
-  <a href="#-网页管理">网页管理</a> ·
+  <a href="#-网页管理">网页能做什么</a> ·
   <a href="#-效果预览">效果预览</a> ·
   <a href="#-多人共用与流量配额">多人共用</a> ·
   <a href="#-客户端下载">客户端下载</a> ·
@@ -24,68 +24,76 @@
 
 **gowest** 适合**几个人合租一台海外服务器**：在空白的 Ubuntu 24.04 上，用一条命令部署 **Hysteria2 + VLESS REALITY** 双协议代理，每人一个订阅链接，带宽公平分配，按月控制流量，四端订阅都已配好 AI / Claude 分流。一个人用也完全可以。
 
-- **一条命令或一个网页**：在自己电脑上运行，零问答安装；失败自动回滚；也可以在本地网页里点几下完成安装和日常管理。
+- **一个本地网页搞定**：在自己电脑上打开管理页面，点几下完成安装、导入和日常配置；也可以用一条命令；失败自动回滚。
 - **双线路互备**：Hy2 优先，故障时自动切到 VLESS，不会悄悄走直连。
 - **多人共用**：每人一个订阅链接；忙时均分，闲时拉满；随时加人、删人、换链接，其他人不受影响。
 - **按人管流量**：每个链接可以单独设速度上限、月流量额度和到期日，超了只停那一个人。
-- **解锁检测**：一条命令看这台服务器能不能用 Claude、ChatGPT、TikTok、YouTube。
+- **解锁检测**：点一下就能看这台服务器能不能用 Claude、ChatGPT、TikTok、YouTube。
 
 ## 🚀 快速开始
 
-**1. 准备服务器**：空白 Ubuntu 24.04，在云控制台的安全组放行 **TCP/UDP 443** 和 **TCP 80**。多人共用时改为放行 **TCP/UDP 20001-20032** 和 **TCP 80**，以后加人就不用再改安全组。
+**1. 准备服务器**：一台空白的 Ubuntu 24.04，能用 SSH 密钥登录。在云控制台的安全组放行 **TCP/UDP 443** 和 **TCP 80**；多人共用时改为放行 **TCP/UDP 20001-20032** 和 **TCP 80**，以后加人就不用再改安全组。
 
-**2. 在你自己的电脑上运行**（通过 SSH 把代码传到服务器，服务器上不需要 git）：
+**2. 在你自己的电脑上打开管理页面**：
 
 ```sh
 git clone https://github.com/lileilei2023/gowest.git && cd gowest
-./remote.sh root@<服务器IP> quick 100Mbps              # 零问答，一个人用
-./remote.sh root@<服务器IP> quick 100Mbps --users 3    # 三个人共用
-```
-
-`quick` 自动识别 IP、用默认设置直接安装，装完从你电脑上检查端口通不通，并在终端显示手机扫码导入的二维码。想逐项确认设置，就不加 `quick`，运行中文向导。
-
-**3. 导入客户端**：随时可以查看订阅地址和二维码：
-
-```sh
-./remote.sh root@<服务器IP> urls --client mac          # 或 windows / android / shadowrocket
-./remote.sh root@<服务器IP> urls --client all --qr     # 手机扫码导入
-./remote.sh root@<服务器IP> check                      # 从这台电脑检查端口和订阅是否通
-```
-
-**以后升级**：拉取最新代码后一条命令，密钥、端口和订阅地址都不变，客户端无需重新导入：
-
-```sh
-git pull && ./remote.sh root@<服务器IP> upgrade
-```
-
-更喜欢点按钮的话，见下面的 [网页管理](#-网页管理)。Windows 电脑没有 `sh` 时，可以用网页管理，或者 SSH 登录服务器后在服务器上 `git clone`，再运行 `sudo bash deploy.sh`（升级用 `sudo bash deploy.sh upgrade --confirm-server <服务器IP>`）。
-
-客户端去哪下载，见 [客户端下载](#-客户端下载)。更多方式（非交互安装、本机预览配置、安全组模板）见 [快速部署](docs/快速部署.md)。
-
-## 🖥 网页管理
-
-```sh
 ./remote.sh ui          # Windows：python gowest_ui.py
 ```
 
-会在你自己的电脑上打开一个管理页面：
+**3. 在页面里点三下**：
 
-- 添加多台服务器，查看运行状态、本月流量和每个人的用量；
-- 在空白服务器上一键安装，实时显示安装进度；
-- 加人、删人、重置链接，设置速度上限、流量额度和到期日；
-- 显示二维码，手机对着屏幕扫一下就能导入；
-- 一键检查端口连通、解锁检测和升级。
+1. **添加服务器**：填 `root@服务器IP`。
+2. **开始安装**：填套餐带宽和人数（可选：每月流量上限），安装进度会实时显示，大约 2–5 分钟。
+3. **导入**：点每个人旁边的二维码，手机对着屏幕扫一下；电脑点"导入日常分流"。
+
+之后加人、删人、改额度、检查连通、解锁检测和升级，都在这个页面里完成。客户端去哪下载，见 [客户端下载](#-客户端下载)。
 
 <p align="center"><img src="docs/images/webui.png" alt="本地网页管理" width="100%"></p>
+
+<details>
+<summary><b>更喜欢命令行？</b></summary>
+
+页面上的每个按钮都对应一条命令，效果完全相同：
+
+```sh
+./remote.sh root@<服务器IP> quick 100Mbps --users 3   # 零问答安装（一个人用时去掉 --users）
+./remote.sh root@<服务器IP>                           # 或者用中文向导逐项确认
+./remote.sh root@<服务器IP> urls --client all --qr    # 订阅地址和二维码
+./remote.sh root@<服务器IP> check                     # 从这台电脑检查端口和订阅
+git pull && ./remote.sh root@<服务器IP> upgrade       # 升级：密钥、端口和订阅地址都不变
+```
+
+Windows 上没有 `sh`：用网页，或者 SSH 登录服务器后在服务器上 `git clone`，再运行 `sudo bash deploy.sh`。非交互安装、本机预览配置、安全组模板见 [快速部署](docs/快速部署.md)。
+
+</details>
+
+## 🖥 网页管理
+
+| 你想做的事 | 在网页里 | 对应的命令 |
+| --- | --- | --- |
+| 管理多台服务器 | 左侧"添加服务器" | — |
+| 安装 | 未安装的服务器上"开始安装" | `quick 100Mbps --users 3` |
+| 看状态和用量 | 服务器首页：流量、带宽、链接数、服务，每个人的用量 | `status`、`users` |
+| 手机、电脑导入 | 每个人旁边的二维码按钮 | `urls --qr` |
+| 加人 / 删人 / 换链接 | "添加链接"，每行的"⋯"菜单 | `users add / remove / reset` |
+| 每人速度上限、流量额度、到期日 | 每行的编辑按钮 | `users set` |
+| 整台服务器的带宽、月流量、计量方式 | 首页卡片右上角的编辑按钮 | `bandwidth`、`traffic` |
+| 检查端口、解锁检测 | 右上角按钮 | `check`、`unlock` |
+| 升级 | 右上角"升级"（有新版本时会提示） | `upgrade` |
+| 卸载（可恢复） | 右上角"⋯"→ 卸载，需输入 IP 确认 | `rollback` |
+
+只能在命令行里做的：HTTPS 订阅（需要自己的域名证书）、Tailscale 例外等高级安装选项，用 `./remote.sh root@<服务器IP>` 的中文向导。
+
 <p align="center"><img src="docs/images/webui-qr.png" alt="扫码导入" width="72%"></p>
 
 **它和 3x-ui、Marzban 这类面板的区别**：那些面板运行在服务器上，要对公网开一个管理端口。gowest 的页面只运行在你的电脑上，所有操作都通过你自己的 SSH 密钥执行，服务器上不开任何新端口，也不常驻面板程序。页面只接受本机访问，地址里带一次性令牌，关掉终端就停止。
 
-前提是能用 SSH 密钥登录服务器（大多数云服务器默认就是），并且登录用户是 root 或者可以免密码 sudo。服务器列表保存在 `~/.gowest/servers.json`，只有你自己能读。截图中的数据为示意。
+前提是登录用户是 root，或者可以免密码 sudo。服务器列表保存在 `~/.gowest/servers.json`，只有你自己能读。想先看看效果，可以运行 `./remote.sh ui --demo`，用示例数据打开页面，不连接任何服务器。截图中的数据为示意。
 
 ## 📸 效果预览
 
-**部署向导**：一个人用时，"共用份数"和"流量上限"直接回车即可。
+**命令行向导**：不用网页时，一个人用的话"共用份数"和"流量上限"直接回车即可。
 
 <p align="center"><img src="docs/images/wizard.png" alt="部署向导" width="92%"></p>
 
@@ -109,7 +117,10 @@ git pull && ./remote.sh root@<服务器IP> upgrade
 
 <p align="center"><img src="docs/images/fair-share.png" alt="按订阅链接分配实测" width="100%"></p>
 
-装好之后随时管理，立即生效，其他人的订阅地址不变：
+装好之后在网页的"订阅链接"表里随时管理，立即生效，其他人的订阅地址不变。命令行的等价写法：
+
+<details>
+<summary><b>命令行</b></summary>
 
 ```sh
 ./remote.sh root@<服务器IP> users                                    # 每个人的端口、上限、本月用量、到期日、状态
@@ -121,17 +132,15 @@ git pull && ./remote.sh root@<服务器IP> upgrade
 ./remote.sh root@<服务器IP> traffic --quota 1TB --on-exceed stop     # 整台服务器的月流量
 ```
 
+</details>
+
 - 每人的用量按他自己的上传加下载统计，订阅里显示的是他自己的用量和额度。整台服务器的用量另外统计，大约是所有人用量之和的两倍，因为服务器收发各算一次，云厂商一般按这个计费。
 - 额度和到期日用 `0` 或 `none` 取消。超额的人下个月自动恢复；调高额度后几分钟内恢复。
 - 只写数字时，流量按 GB、带宽按 Mbps 计算。实现原理见 [详细说明](docs/详细说明.md)。
 
 ## 🧭 Claude / TikTok 能不能用
 
-```sh
-./remote.sh root@<服务器IP> unlock
-```
-
-在服务器上检测出口 IP 的国家和运营商，以及 Claude、ChatGPT、TikTok、YouTube 能否正常使用。所有客户端都从这个 IP 出去，所以结果对每个人都一样。建议买服务器后先测一下再装。检测依据是各网站公开的返回特征，网站调整后可能失准。
+在网页右上角点"解锁检测"，或运行 `./remote.sh root@<服务器IP> unlock`。在服务器上检测出口 IP 的国家和运营商，以及 Claude、ChatGPT、TikTok、YouTube 能否正常使用。所有客户端都从这个 IP 出去，所以结果对每个人都一样。建议买服务器后先测一下再装。检测依据是各网站公开的返回特征，网站调整后可能失准。
 
 ## 📥 客户端下载
 

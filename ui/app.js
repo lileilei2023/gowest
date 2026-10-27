@@ -197,7 +197,9 @@ function serverHead(server, st) {
       ${installed ? btn('check', 'radar', '检查连通') + btn('unlock', 'sparkle', '解锁检测') + btn('upgrade', 'upgrade', '升级', newer) : ''}
       <button class="btn icon" data-act="refresh" title="刷新">${icon('refresh')}</button>
       <div class="menu-wrap"><button class="btn icon" data-act="menu" data-menu="server" title="更多">${icon('more')}</button>
-        ${S.menu === 'server' ? `<div class="menu"><button class="danger" data-act="remove-server">${icon('trash')}从列表移除</button></div>` : ''}
+        ${S.menu === 'server' ? `<div class="menu">
+          <button data-act="remove-server">${icon('x')}从列表移除</button>
+          ${installed ? `<button class="danger" data-act="rollback">${icon('trash')}卸载 gowest…</button>` : ''}</div>` : ''}
       </div>
     </div>
   </div>`;
@@ -419,6 +421,12 @@ const ACTIONS = {
     S.menu = null;
     await loadServers();
   }),
+  rollback: () => { S.menu = null; render(); formModal('卸载 gowest', '停止代理和订阅服务，撤销 gowest 做的网络和防火墙改动。密钥和配置会归档到服务器的 /var/lib/la-vpn-archives，可以恢复；APT 安装的软件包保留。所有人的订阅都会失效。', [
+    { name: 'confirm', label: '输入这台服务器的 IP 确认', placeholder: server().ip, span: true },
+  ], '确认卸载', async (v) => {
+    await api('POST', `/servers/${S.current}/rollback`, v);
+    closeModal(); toast('已卸载，配置已归档'); loadStatus(S.current);
+  }); },
   check: () => busyRun('check', async (id) => {
     const r = await api('POST', `/servers/${id}/check`);
     S.results[id] = { ...(S.results[id] || {}), check: r.rows };
@@ -447,6 +455,7 @@ const ACTIONS = {
     formModal('整台服务器的月流量', '云厂商按整台服务器计费，这里的用量约等于所有人用量之和的两倍（服务器收发各算一次）。', [
       { name: 'quota', label: '每月上限', value: t.quota_bytes ? gb(t.quota_bytes).replace(' ', '') : '', placeholder: '如 1TB；留空 = 不设置' },
       { name: 'on_exceed', label: '超出后', value: t.on_exceed, options: [['warn', '只提醒'], ['stop', '暂停代理到下个月']] },
+      { name: 'metering', label: '计量方式', value: t.metering, span: true, options: [['both', '进 + 出（大多数云厂商，偏保守）'], ['outbound', '只计出方向（套餐只按出流量计费时）']] },
     ], '保存', async (v) => { await api('POST', `/servers/${S.current}/traffic`, v); closeModal(); toast('已更新流量设置'); loadStatus(S.current); });
   },
   'edit-bandwidth': () => formModal('套餐带宽', '多人共用时立即生效；一个人用时客户端更新订阅后生效。订阅地址不变。', [

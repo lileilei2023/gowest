@@ -33,6 +33,21 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(args[args.index('--quota') + 1], '0', 'empty quota clears it')
         self.assertEqual(args[args.index('--cap') + 1], '20Mbps')
 
+    def test_rollback_needs_the_typed_ip(self):
+        with patch.object(ui, 'remote', return_value='archived') as remote:
+            with self.assertRaises(ui.UserError):
+                ui.api_rollback(SERVER, {'confirm': '198.51.100.1'})
+            remote.assert_not_called()
+            ui.api_rollback(SERVER, {'confirm': '203.0.113.7'})
+        self.assertIn('rollback', remote.call_args.args[1])
+
+    def test_traffic_passes_metering(self):
+        with patch.object(ui, 'remote', return_value='ok') as remote:
+            ui.api_traffic(SERVER, {'quota': '1TB', 'on_exceed': 'stop', 'metering': 'outbound'})
+        command = remote.call_args.args[1]
+        self.assertIn('--metering outbound', command)
+        self.assertIn('--confirm-server 203.0.113.7', command)
+
     def test_shell_metacharacters_are_rejected(self):
         for body in ({'action': 'add', 'name': 'x;reboot'}, {'action': 'add', 'name': 'bob', 'quota': '1TB; id'},
                      {'action': 'add', 'name': 'bob', 'expire': '$(id)'}, {'action': 'drop', 'name': 'bob'}):

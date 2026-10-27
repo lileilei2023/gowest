@@ -254,8 +254,18 @@ def api_traffic(server, body):
     args = ['traffic', '--quota', clean(body, 'quota') or '0']
     if body.get('on_exceed') in ('warn', 'stop'):
         args += ['--on-exceed', body['on_exceed']]
+    if body.get('metering') in ('both', 'outbound'):
+        args += ['--metering', body['metering']]
     out = remote(server['target'], installed_command(args + ['--confirm-server', server['ip']]))
     return {'output': out}
+
+
+def api_rollback(server, body):
+    # Typing the IP is the confirmation, as on the command line.
+    if str(body.get('confirm', '')).strip() != server['ip']:
+        raise UserError('请输入这台服务器的 IP 以确认卸载')
+    out = remote(server['target'], installed_command(['rollback']), timeout=300)
+    return {'output': ANSI.sub('', out)}
 
 
 def api_check(server):
@@ -390,6 +400,7 @@ class Handler(BaseHTTPRequestHandler):
                       'users': lambda: api_users(server, body),
                       'bandwidth': lambda: api_bandwidth(server, body),
                       'traffic': lambda: api_traffic(server, body),
+                      'rollback': lambda: api_rollback(server, body),
                       'install': lambda: {'job': api_install(server, body).id},
                       'upgrade': lambda: {'job': api_upgrade(server).id}}
             if action in simple:
