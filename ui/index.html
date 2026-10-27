@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gowest 管理</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%2338bdf8'/%3E%3Cstop offset='.6' stop-color='%236366f1'/%3E%3Cstop offset='1' stop-color='%23a855f7'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='16' fill='url(%23g)'/%3E%3Ccircle cx='18' cy='32' r='5' fill='white'/%3E%3Cpath d='M18 32h28M36 21l11 11-11 11' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <div class="logo"><svg viewBox="0 0 64 64" width="22" height="22"><circle cx="15" cy="32" r="6" fill="#fff"/><path d="M15 32h32M36 19l13 13-13 13" stroke="#fff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg></div>
+      <div><b>gowest</b><small>本地管理</small></div>
+    </div>
+    <div class="side-label">服务器</div>
+    <nav id="servers" class="servers"></nav>
+    <button class="side-add" data-act="add-server"><span class="i" data-i="plus"></span>添加服务器</button>
+    <div class="side-foot"><span class="i" data-i="shield"></span><span>只在这台电脑上运行，<br>不在服务器开放任何端口</span></div>
+  </aside>
+  <main id="main" class="main"></main>
+</div>
+<div id="layer" class="layer" hidden></div>
+<div id="toasts" class="toasts"></div>
+<script src="vendor/qrcode.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

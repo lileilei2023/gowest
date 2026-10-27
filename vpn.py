@@ -941,7 +941,10 @@ def user_rows(cfg):
         row = record.get('users', {}).get(name, {})
         used = row.get('upload', 0) + row.get('download', 0)
         quota = cfg['user_quota'].get(name, 0)
-        rows.append({'name': name, 'port': port,
+        rows.append({'name': name, 'port': port, 'cap_mbps': cfg['user_caps'].get(name),
+                     'used_bytes': used, 'quota_bytes': quota, 'upload': row.get('upload', 0),
+                     'download': row.get('download', 0), 'paused': row.get('paused', ''),
+                     'expire_date': cfg['user_expire'].get(name, ''),
                      'cap': f"{cfg['user_caps'][name]} Mbps" if name in cfg['user_caps'] else '不限',
                      'used': format_gb(used) + (f' / {format_gb(quota)}' if quota else ''),
                      'expire': cfg['user_expire'].get(name, '不限'),
@@ -956,6 +959,43 @@ def print_users(cfg):
     print(f'{"名字":<12}{"端口":<8}{"速度上限":<12}{"本月用量 / 额度":<24}{"到期日":<12}状态')
     for r in user_rows(cfg):
         print(f"{r['name']:<14}{r['port']:<10}{r['cap']:<14}{r['used']:<28}{r['expire']:<15}{r['status']}")
+
+
+def status_report():
+    """Everything the local web UI shows for one server, machine-readable."""
+    s = load_state()
+    cfg = settings(json.loads((CONFIG / 'settings.json').read_text()))
+    usage = STATE / 'traffic.json'
+    traffic = json.loads(usage.read_text()) if usage.is_file() else {}
+    health = network.health(STATE / 'network.json')
+    return {'status': s['status'], 'server_ip': s['server_ip'], 'created_at': s['created_at'],
+            'kit_version': s.get('kit_version', '0.5.9 或更早'), 'sing_box': sing_box_version() or 'unknown',
+            'services': {name: run(['systemctl', 'is-active', name], check=False).stdout.strip() for name in SERVICES},
+            'node_prefix': cfg['node_prefix'], 'bandwidth_mbps': cfg['hy2_down_mbps'],
+            'subscription_scheme': cfg['subscription']['scheme'], 'fair_share': cfg['fair_share'],
+            'fair_share_result': health['fair_share']['result'], 'bbr': not any('BBR' in w for w in health['warnings']),
+            'warnings': health['warnings'],
+            'traffic': {'month': traffic.get('month'), 'used_bytes': traffic.get('used_bytes'),
+                        'quota_bytes': cfg['traffic']['total_bytes'], 'metering': cfg['traffic']['metering'],
+                        'on_exceed': cfg['traffic']['on_exceed'], 'paused_month': traffic.get('paused_month')},
+            'single': not cfg['users'], 'users': user_rows(cfg) if cfg['users'] else []}
+
+
+def url_report(user):
+    """One URL's subscription links and app deep links, machine-readable."""
+    from render import install_link, profile_names
+    cfg = settings(json.loads((CONFIG / 'settings.json').read_text()))
+    if cfg['users'] and user not in cfg['users']:
+        raise RuntimeError('多人模式请指定其中一人：' + '、'.join(cfg['users']))
+    generated = STATE / 'generated' / account_dir(user)
+    base = (generated / 'subscription-urls.txt').read_text().splitlines()[0].split(': ', 1)[1]
+    names = profile_names(cfg['node_prefix'], user)
+    return {'user': user, 'base': base,
+            'files': {name: base + suffix for suffix, name in SUBSCRIPTION_FILES.items()},
+            'clash': {'normal': install_link('clash', base, names['normal']),
+                      'strict': install_link('clash', base + '-us', names['strict'])},
+            'clashmeta': {'normal': install_link('clashmeta', base, names['normal']),
+                          'strict': install_link('clashmeta', base + '-us', names['strict'])}}
 
 
 def change_users(confirm, action, name='', cap=None, quota=None, expire=None):
@@ -1048,7 +1088,8 @@ def main(argv=None):
             item.add_argument('--confirm-new-server', required=True)
             item.add_argument('--host-firewall', choices=('auto', 'check'), default='auto',
                               help='auto: 保守新增 UFW 放行规则；check: 仅检查。均不修改云安全组')
-    sub.add_parser('status')
+    item = sub.add_parser('status')
+    item.add_argument('--json', action='store_true', help=argparse.SUPPRESS)
     item = sub.add_parser('repair-fq', help='Repair a reviewed skipped FIFO without restarting proxy services')
     item.add_argument('--confirm-server', required=True)
     item.add_argument('--adopt-default-fifo', action='store_true',
@@ -1062,6 +1103,7 @@ def main(argv=None):
                            'android = Clash Meta for Android; shadowrocket = iOS')
     item.add_argument('--user', default='', help='多人共用时指定用户名')
     item.add_argument('--qr', action='store_true', help='在终端显示二维码，手机直接扫码导入')
+    item.add_argument('--json', action='store_true', help=argparse.SUPPRESS)
     item = sub.add_parser('bandwidth', help='调整套餐带宽，或某个订阅链接的上限；多人模式即时生效')
     target = item.add_mutually_exclusive_group(required=True)
     target.add_argument('--set', help='总带宽，如 30Mbps、1Gbps')
@@ -1080,7 +1122,8 @@ def main(argv=None):
     item.add_argument('--quota', help='每月流量额度，如 100（即 100GB）、1TB；0 表示不限。超出后只停这一个链接')
     item.add_argument('--expire', help='到期日，如 2026-12-31（当天结束后停用）；none 表示不限')
     item.add_argument('--confirm-server')
-    sub.add_parser('unlock', help='检测这台服务器的 IP 能否使用 Claude、ChatGPT、TikTok、YouTube')
+    item = sub.add_parser('unlock', help='检测这台服务器的 IP 能否使用 Claude、ChatGPT、TikTok、YouTube')
+    item.add_argument('--json', action='store_true', help=argparse.SUPPRESS)
     sub.add_parser('endpoints', help=argparse.SUPPRESS)
     item = sub.add_parser('upgrade', help='用当前这份代码升级已安装的服务器；密钥和订阅地址不变')
     item.add_argument('--confirm-server', required=True)
@@ -1146,7 +1189,10 @@ def main(argv=None):
             change_users(args.confirm_server, args.action, args.name, args.cap, args.quota, args.expire)
     elif args.command == 'unlock':
         import unlock
-        unlock.main()
+        if args.json:
+            print(json.dumps(unlock.report(), ensure_ascii=False))
+        else:
+            unlock.main()
     elif args.command == 'endpoints':
         # Machine-readable, for remote.sh's outside-in check; prints private URLs.
         cfg = settings(json.loads((CONFIG / 'settings.json').read_text()))
@@ -1165,6 +1211,8 @@ def main(argv=None):
         cfg = settings(json.loads((CONFIG / 'settings.json').read_text()))
         hostfirewall.display(hostfirewall.inspect(cfg))
         print('Local verification passed; not an external client/throughput test.')
+    elif args.command == 'status' and args.json:
+        print(json.dumps(status_report(), ensure_ascii=False))
     elif args.command == 'status':
         s = load_state()
         print(dump(dict({k: s[k] for k in ('status', 'server_ip', 'created_at')},
@@ -1184,6 +1232,9 @@ def main(argv=None):
     elif args.command == 'urls':
         if load_state()['status'] != 'installed':
             raise RuntimeError('Deployment is not committed; subscription URLs are not ready')
+        if args.json:
+            print(json.dumps(url_report(args.user), ensure_ascii=False))
+            return
         users = settings(json.loads((CONFIG / 'settings.json').read_text()))['users']
         user = args.user
         if users and user not in users:

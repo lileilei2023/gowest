@@ -91,6 +91,11 @@ CHECKS = (('Claude', claude), ('ChatGPT', chatgpt), ('TikTok', tiktok), ('YouTub
 MARK = {'ok': '✓', 'warn': '!', 'fail': '✗'}
 
 
+def report():
+    return {'ip': ip_info(), 'checks': [dict(zip(('name', 'level', 'text'), (name, *check())))
+                                        for name, check in CHECKS]}
+
+
 def main():
     info = ip_info()
     print(f"出口 IP：{info['ip']}  国家/地区：{info['country']}  城市：{info['city']}  运营商：{info['org']}")

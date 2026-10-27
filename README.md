@@ -3,15 +3,16 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.7.0-6366f1">
+  <img alt="version" src="https://img.shields.io/badge/version-0.8.0-6366f1">
   <img alt="platform" src="https://img.shields.io/badge/server-Ubuntu%2024.04%20amd64%20%7C%20arm64-e95420">
   <img alt="sing-box" src="https://img.shields.io/badge/sing--box-1.14.3-0ea5e9">
-  <img alt="tests" src="https://img.shields.io/badge/tests-262%20passed-22c55e">
+  <img alt="tests" src="https://img.shields.io/badge/tests-271%20passed-22c55e">
   <img alt="clients" src="https://img.shields.io/badge/clients-macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-64748b">
 </p>
 
 <p align="center">
   <a href="#-快速开始">快速开始</a> ·
+  <a href="#-网页管理">网页管理</a> ·
   <a href="#-效果预览">效果预览</a> ·
   <a href="#-多人共用与流量配额">多人共用</a> ·
   <a href="#-客户端下载">客户端下载</a> ·
@@ -23,7 +24,7 @@
 
 **gowest** 适合**几个人合租一台海外服务器**：在空白的 Ubuntu 24.04 上，用一条命令部署 **Hysteria2 + VLESS REALITY** 双协议代理，每人一个订阅链接，带宽公平分配，按月控制流量，四端订阅都已配好 AI / Claude 分流。一个人用也完全可以。
 
-- **一条命令**：在自己电脑上运行，中文向导，几个问题就装好；失败自动回滚；升级也是一条命令。
+- **一条命令或一个网页**：在自己电脑上运行，零问答安装；失败自动回滚；也可以在本地网页里点几下完成安装和日常管理。
 - **双线路互备**：Hy2 优先，故障时自动切到 VLESS，不会悄悄走直连。
 - **多人共用**：每人一个订阅链接；忙时均分，闲时拉满；随时加人、删人、换链接，其他人不受影响。
 - **按人管流量**：每个链接可以单独设速度上限、月流量额度和到期日，超了只停那一个人。
@@ -57,9 +58,30 @@ git clone https://github.com/lileilei2023/gowest.git && cd gowest
 git pull && ./remote.sh root@<服务器IP> upgrade
 ```
 
-Windows 电脑没有 `sh` 时，可以 SSH 登录服务器后在服务器上 `git clone`，再运行 `sudo bash deploy.sh`（升级用 `sudo bash deploy.sh upgrade --confirm-server <服务器IP>`）。
+更喜欢点按钮的话，见下面的 [网页管理](#-网页管理)。Windows 电脑没有 `sh` 时，可以用网页管理，或者 SSH 登录服务器后在服务器上 `git clone`，再运行 `sudo bash deploy.sh`（升级用 `sudo bash deploy.sh upgrade --confirm-server <服务器IP>`）。
 
 客户端去哪下载，见 [客户端下载](#-客户端下载)。更多方式（非交互安装、本机预览配置、安全组模板）见 [快速部署](docs/快速部署.md)。
+
+## 🖥 网页管理
+
+```sh
+./remote.sh ui          # Windows：python gowest_ui.py
+```
+
+会在你自己的电脑上打开一个管理页面：
+
+- 添加多台服务器，查看运行状态、本月流量和每个人的用量；
+- 在空白服务器上一键安装，实时显示安装进度；
+- 加人、删人、重置链接，设置速度上限、流量额度和到期日；
+- 显示二维码，手机对着屏幕扫一下就能导入；
+- 一键检查端口连通、解锁检测和升级。
+
+<p align="center"><img src="docs/images/webui.png" alt="本地网页管理" width="100%"></p>
+<p align="center"><img src="docs/images/webui-qr.png" alt="扫码导入" width="72%"></p>
+
+**它和 3x-ui、Marzban 这类面板的区别**：那些面板运行在服务器上，要对公网开一个管理端口。gowest 的页面只运行在你的电脑上，所有操作都通过你自己的 SSH 密钥执行，服务器上不开任何新端口，也不常驻面板程序。页面只接受本机访问，地址里带一次性令牌，关掉终端就停止。
+
+前提是能用 SSH 密钥登录服务器（大多数云服务器默认就是），并且登录用户是 root 或者可以免密码 sudo。服务器列表保存在 `~/.gowest/servers.json`，只有你自己能读。截图中的数据为示意。
 
 ## 📸 效果预览
 
@@ -154,6 +176,8 @@ Mac / Windows 也可以直接运行 `clients/` 里的一键脚本，自动下载
 ```text
 gowest/
 ├── remote.sh                 # 在自己电脑上运行：上传、安装、升级、管理
+├── gowest_ui.py, ui/         # 本地网页管理（只在自己电脑上运行，经 SSH 操作服务器）
+├── localcheck.py             # 从自己电脑检查端口和订阅是否通
 ├── deploy.sh / launcher.py   # 中文向导与统一入口
 ├── vpn.py                    # plan / install / upgrade / status / verify / urls / users / unlock / bandwidth / traffic / rollback
 ├── accounting.py             # 每个链接的流量计数、超额或到期暂停（nftables）

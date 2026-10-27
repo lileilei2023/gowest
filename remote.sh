@@ -3,6 +3,7 @@
 # install, upgrade or manage it there. The server needs no git and no
 # access to this (private) repository.
 #
+#   ./remote.sh ui                                  打开本地管理页面（浏览器）
 #   ./remote.sh root@203.0.113.7                    首次安装（中文向导）
 #   ./remote.sh root@203.0.113.7 quick 100Mbps      零问答安装（可加 --users 3）
 #   ./remote.sh root@203.0.113.7 check             从这台电脑测端口和订阅是否通
@@ -15,8 +16,12 @@ set -eu
 kit_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 remote_dir=${GOWEST_REMOTE_DIR:-gowest}
 
+if [ "${1:-}" = ui ]; then
+    shift
+    exec python3 "$kit_dir/gowest_ui.py" "$@"
+fi
 if [ $# -lt 1 ] || [ "$1" = -h ] || [ "$1" = --help ]; then
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
 fi
 target=$1
@@ -54,31 +59,7 @@ with_ip() {
 check() {
     # Outside-in: what a client on the internet sees, which the server itself cannot tell.
     info=$(ssh "$target" "if [ -x /opt/la-vpn/gowest ]; then sudo /opt/la-vpn/gowest endpoints; else sudo bash /opt/la-vpn/deploy.sh endpoints; fi")
-    python3 - "$info" <<'PY'
-import json, socket, sys, urllib.request
-info = json.loads(sys.argv[1])
-ip, ok = info['server_ip'], True
-def tcp(port):
-    try:
-        socket.create_connection((ip, port), timeout=5).close()
-        return True
-    except OSError:
-        return False
-for port in info['proxy_ports'] + info['subscription_ports']:
-    good = tcp(port)
-    ok &= good
-    print(f"  {'✓' if good else '✗'} TCP {port}" + ('' if good else '  不通：检查云安全组和本机防火墙'))
-try:
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(info['subscription_url'], timeout=8) as r:
-        print(f"  ✓ 订阅可以下载（HTTP {r.status}）")
-except Exception as e:
-    ok = False
-    print(f"  ✗ 订阅下载失败：{type(e).__name__}")
-print('  · UDP（Hy2）无法从外部探测；请确认安全组也放行了 UDP ' + '、'.join(map(str, info['proxy_ports']))
-      + '。Hy2 不通时客户端会自动改走 VLESS。')
-sys.exit(0 if ok else 1)
-PY
+    python3 "$kit_dir/localcheck.py" "$info"
 }
 
 action=$1
