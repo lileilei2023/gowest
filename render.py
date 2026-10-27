@@ -3,6 +3,7 @@
 import argparse
 import base64
 import copy
+import datetime
 import hashlib
 import ipaddress
 import json
@@ -19,7 +20,7 @@ import routing
 
 DOMAINS = routing.CLAUDE
 PROJECT_NAME = 'gowest'
-KIT_VERSION = '0.6.0'
+KIT_VERSION = '0.7.0'
 SELECT_GROUP = '出口选择'
 AUTO_GROUP = '自动回退'
 # Tailscale control plane stays direct on every Mihomo client:
@@ -71,7 +72,8 @@ def domain(value):
 def settings(raw):
     allowed = {'server_ip', 'node_prefix', 'hy2_up_mbps', 'hy2_down_mbps', 'ipv6',
                'tailnet', 'hosts', 'reality_server_name', 'hy2_server_name',
-               'subscription', 'traffic', 'users', 'fair_share', 'user_caps', 'user_port_base'}
+               'subscription', 'traffic', 'users', 'fair_share', 'user_caps', 'user_port_base',
+               'user_ports', 'user_quota', 'user_expire'}
     if set(raw) - allowed:
         raise ValueError('Unknown settings fields: ' + ', '.join(sorted(set(raw) - allowed)))
     s = copy.deepcopy(raw)
@@ -143,8 +145,8 @@ def settings(raw):
     # Several people sharing one server: each subscription URL is one share with
     # its own port; HTB guarantees bandwidth/N per URL and lends idle capacity.
     s.setdefault('fair_share', len(users) > 1)
-    if type(s['fair_share']) is not bool or (s['fair_share'] and len(users) < 2):
-        raise ValueError('fair_share needs at least two named users')
+    if type(s['fair_share']) is not bool or (s['fair_share'] and not users):
+        raise ValueError('fair_share needs named users')
     caps = s.setdefault('user_caps', {})
     if type(caps) is not dict or set(caps) - set(users) or any(
             type(v) is not int or not 0 < v <= 100000 for v in caps.values()):
@@ -153,15 +155,56 @@ def settings(raw):
     # Below the Linux ephemeral range (32768+) so outgoing sockets never hold them.
     if type(base) is not int or not 1024 <= base or base + len(users) > 32767:
         raise ValueError('user_port_base must keep per-user ports within 1025-32767')
+    # Ports are pinned per name once users change after install, so removing
+    # one URL never moves anyone else's port (and breaks their subscription).
+    pinned = s.setdefault('user_ports', {})
+    if type(pinned) is not dict or (pinned and set(pinned) != set(users)) or any(
+            type(v) is not int or not 1025 <= v <= 32767 for v in pinned.values()):
+        raise ValueError('user_ports must give every user a port within 1025-32767')
+    if len(set(proxy_ports(s))) != len(proxy_ports(s)):
+        raise ValueError('Per-user proxy ports must be unique')
+    quota = s.setdefault('user_quota', {})
+    if type(quota) is not dict or set(quota) - set(users) or any(
+            type(v) is not int or v <= 0 for v in quota.values()):
+        raise ValueError('user_quota must map existing users to a positive byte count')
+    expire = s.setdefault('user_expire', {})
+    if type(expire) is not dict or set(expire) - set(users):
+        raise ValueError('user_expire must map existing users to a date')
+    for value in expire.values():
+        parse_date(value)
     reserved = {22, 443} | {x['port'] for x in subscription_endpoints(s)}
     if users and reserved & set(proxy_ports(s)):
         raise ValueError('Per-user proxy ports collide with SSH, 443 or subscription ports')
     return s
 
 
+def parse_date(text):
+    """'2026-12-31' or '2026/12/31' -> '2026-12-31'; the URL works through that whole day."""
+    value = str(text).strip().replace('/', '-')
+    try:
+        return datetime.date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise ValueError('到期日请写成 2026-12-31 这样的日期') from None
+
+
 def proxy_ports(s):
     """One port per subscription URL in shared mode (TCP VLESS + UDP Hy2)."""
-    return [s['user_port_base'] + i for i in range(1, len(s['users']) + 1)] if s['users'] else [443]
+    if not s['users']:
+        return [443]
+    if s.get('user_ports'):
+        return [s['user_ports'][name] for name in s['users']]
+    return [s['user_port_base'] + i for i in range(1, len(s['users']) + 1)]
+
+
+def free_port(s):
+    """Lowest unused per-user port above the base, for a newly added URL."""
+    used = set(proxy_ports(s)) | {22, 443} | {x['port'] for x in subscription_endpoints(s)}
+    port = s['user_port_base'] + 1
+    while port in used:
+        port += 1
+    if port > 32767:
+        raise ValueError('No free per-user port below 32768')
+    return port
 
 
 def parse_bytes(text):
@@ -211,6 +254,12 @@ def accounts(s, k):
     return [dict(k, port=port, **user) for user, port in zip(k['users'], proxy_ports(s))]
 
 
+def new_credentials():
+    """One URL's own secrets: proxy identity plus an unguessable subscription token."""
+    return {'uuid': str(uuid.uuid4()), 'hy2_password': secrets.token_urlsafe(32),
+            'subscription_token': secrets.token_hex(24)}
+
+
 def make_secrets(out, s):
     def run(args, data=None):
         return subprocess.run(['openssl'] + args, input=data, check=True,
@@ -229,8 +278,7 @@ def make_secrets(out, s):
     k = {'reality_private_key': b64(private_der[-32:]),
          'reality_public_key': b64(public_der[-32:]), 'short_id': secrets.token_hex(8),
          'obfs_password': secrets.token_urlsafe(32), 'certificate_fingerprint': hashlib.sha256(der).hexdigest()}
-    user = lambda: {'uuid': str(uuid.uuid4()), 'hy2_password': secrets.token_urlsafe(32),
-                    'subscription_token': secrets.token_hex(24)}
+    user = new_credentials
     if s['users']:
         # Each person gets independent credentials and a private subscription
         # token, so one link can be revoked or leak without exposing others.
@@ -617,11 +665,14 @@ http {
     for a in accounts(s, k):
         folder = a['name'] + '/' if a['name'] else ''
         label = s['node_prefix'] + ('-' + a['name'] if a['name'] else '')
+        # Each URL shows its own usage, quota and expiry. The bracket makes the
+        # include a glob, so Nginx starts before the timer first writes the file.
+        subinfo = f"/etc/la-vpn/subinfo.d/{a['name']}.con[f]" if a['name'] else '/etc/la-vpn/subinfo.conf'
         for suffix, file in SUBSCRIPTION_FILES.items():
             text += f'''        location = /sub/{a['subscription_token']}{suffix} {{
             alias /etc/la-vpn/subscriptions/{folder}{file};
             default_type {'text/yaml' if file.endswith('.yaml') else 'text/plain'};
-            include /etc/la-vpn/subinfo.conf;
+            include {subinfo};
             add_header profile-update-interval 24 always;
             add_header Content-Disposition 'attachment; filename="{label}-{file}"' always;
             add_header Cache-Control "no-store" always;

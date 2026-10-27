@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 import render
 
 ROOT = Path(__file__).resolve().parent
-MODULES = ('launcher', 'vpn', 'render', 'routing', 'network', 'subinfo',
+MODULES = ('launcher', 'vpn', 'render', 'routing', 'network', 'subinfo', 'accounting', 'unlock',
            'autoconfig', 'hostfirewall', 'firewall', 'kit_runtime', 'installlog')
 ALLOWED_RELEASE_FILES = {'gowest', '使用说明.md', 'THIRD-PARTY-NOTICES.txt',
                          'build-info.json', 'SHA256SUMS'}

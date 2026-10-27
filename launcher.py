@@ -10,6 +10,7 @@ import platform
 import re
 import subprocess
 import sys
+import time
 
 sys.dont_write_bytecode = True
 import render
@@ -18,7 +19,7 @@ import kit_runtime
 
 ROOT = Path(__file__).resolve().parent
 MANAGEMENT = {'plan', 'install', 'status', 'verify', 'urls', 'rollback', 'repair-fq', 'bandwidth', 'traffic',
-              'upgrade'}
+              'upgrade', 'users', 'unlock', 'endpoints'}
 
 
 def build_settings(server_ip, up, down, mode, host='', cert='', key='', tailnet='',
@@ -191,6 +192,27 @@ def wizard():
     dispatch(['install', '--settings', str(output), '--confirm-new-server', config['server_ip']])
 
 
+def quick_install(a):
+    """Install straight away with defaults; every choice can be changed later."""
+    if platform.system() != 'Linux' or os.geteuid() != 0:
+        raise ValueError('quick 需要在新服务器上以 root 运行（在自己电脑上用 ./remote.sh root@<IP> quick 100Mbps）')
+    up, down = bandwidth_values(a.bandwidth)
+    names, caps = parse_users(a.users)
+    detected = autoconfig.detect_public_ipv4()
+    address = detected['address']
+    print(f'公网 IPv4：{address}（{detected["source"]}）；带宽 {down} Mbps；'
+          + (f'{len(names)} 个订阅链接' if names else '1 份') + '；订阅走 HTTP（明文，勿在不可信网络里更新订阅）。')
+    config = build_settings(address, up, down, 'http', accept_http_risk=True, node_prefix=a.node_prefix,
+                            users=names, quota=a.monthly_quota, on_exceed=a.on_exceed, user_caps=caps)
+    output = ROOT / 'settings.local.json'
+    if output.exists() or output.is_symlink():
+        output = ROOT / time.strftime('settings-%Y%m%d-%H%M%S.json')
+    save_settings(config, output)
+    ports = '、'.join(str(p) for p in render.proxy_ports(config))
+    print(f'云安全组请放行 TCP/UDP {ports} 和 TCP 80' + ('（多人时建议直接放行 20001-20032，以后加人不用再改）' if names else '') + '。')
+    dispatch(['install', '--settings', str(output), '--confirm-new-server', address])
+
+
 def dispatch(arguments):
     if kit_runtime.compiled():
         import vpn
@@ -218,7 +240,8 @@ def main(argv=None):
         import subinfo
         return subinfo.main()
     parser = argparse.ArgumentParser(prog='gowest', description=render.PROJECT_NAME + '：双客户端代理部署与配置生成', epilog=(
-        '无参数：交互向导。管理命令：plan / install / status / verify / urls / bandwidth / traffic / rollback / repair-fq。'
+        '无参数：交互向导；quick 100Mbps：零问答安装。管理命令：plan / install / upgrade / status / verify / urls / users / '
+        'unlock / bandwidth / traffic / rollback / repair-fq。'
         'firewall generate / check 离线准备云端模板。'
         '各命令可加 --help；脚本不会自动 SSH，也不会自动提权。'))
     parser.add_argument('--version', action='version', version=render.PROJECT_NAME + ' ' + render.KIT_VERSION)
@@ -247,11 +270,19 @@ def main(argv=None):
     init.add_argument('--on-exceed', choices=('warn', 'stop'), default='warn',
                       help='超出上限：warn 只提醒；stop 暂停代理直到下月或上限调高')
     init.add_argument('--output', default='settings.local.json')
+    quick = commands.add_parser('quick', help='零问答安装：自动识别 IP，HTTP 订阅，其余用默认值；以后都能再改')
+    quick.add_argument('bandwidth', help='套餐带宽，如 100、100Mbps、1Gbps')
+    quick.add_argument('--users', default='', help='共用份数（如 3）或名字（alice,bob,carol）；默认 1 份')
+    quick.add_argument('--monthly-quota', default='', help='整台服务器每月流量上限，如 1TB；默认不设置')
+    quick.add_argument('--on-exceed', choices=('warn', 'stop'), default='warn')
+    quick.add_argument('--node-prefix', default='LA')
     commands.add_parser('firewall', help='离线生成/校验防火墙模板；详见 firewall --help')
     offline = commands.add_parser('render', help='离线生成全部客户端配置；不安装、不发布链接')
     offline.add_argument('--settings', required=True)
     offline.add_argument('--output', required=True)
     a = parser.parse_args(argv)
+    if a.command == 'quick':
+        return quick_install(a)
     if a.command == 'render':
         result = render.render(json.loads(Path(a.settings).read_text()), a.output)
         print('全部客户端配置已生成至私有目录：' + str(result) + '；尚未安装或发布。')

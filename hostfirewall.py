@@ -97,12 +97,15 @@ def inspect(settings):
             report['warnings'].append('检测到原生 iptables 规则；不覆盖自定义策略，请人工放行。')
             return report
     if shutil.which('nft'):
-        result = inspect_command(['nft', 'list', 'ruleset'])
+        result = inspect_command(['nft', 'list', 'tables'])
         if result.returncode:
             report['warnings'].append('无法读取 nftables；防火墙状态未知。')
             return report
         observed = True
-        if result.stdout.strip():
+        # gowest's own per-URL counter table is not an administrator policy.
+        others = [line for line in result.stdout.splitlines()
+                  if line.strip() and line.strip() != 'table inet la_vpn_acct']
+        if others:
             report['warnings'].append('检测到原生 nftables 规则；不覆盖自定义策略，请人工放行。')
             return report
     if observed:
@@ -166,7 +169,18 @@ def apply(settings, state, save, mode='auto'):
         report['warnings'].append(str(error))
         save(state)
         return report
-    for proto, port in required_ports(settings):
+    add_rules(journal, report, required_ports(settings), overlaps, tag, state, save)
+    report['status'] = 'ufw-rules-processed'
+    if any(overlaps.values()):
+        report['status'] = 'ufw-overlap-needs-review'
+    report['warnings'].append('已处理 UFW 放行规则；自定义底层规则和云安全组仍可能阻断。')
+    save(state)
+    return report
+
+
+def add_rules(journal, report, pairs, overlaps, tag, state, save):
+    """Add one journaled UFW allow per (proto, port), skipping any overlap."""
+    for proto, port in pairs:
         if file_digests() != journal['expected']:
             raise RuntimeError('UFW 规则在部署期间被外部修改；停止自动配置')
         if overlaps[(proto, port)] or overlaps_existing(proto, port):
@@ -192,12 +206,25 @@ def apply(settings, state, save, mode='auto'):
         save(state)
         if result.returncode:
             raise RuntimeError('UFW 自动放行失败，请检查规则与权限')
-    report['status'] = 'ufw-rules-processed'
-    if any(overlaps.values()):
-        report['status'] = 'ufw-overlap-needs-review'
-    report['warnings'].append('已处理 UFW 放行规则；自定义底层规则和云安全组仍可能阻断。')
-    save(state)
-    return report
+
+
+def add_ports(settings, state, save, pairs):
+    """Open a newly added URL's ports the same careful way, only where the
+    install itself managed UFW and nobody has edited UFW since. Returns
+    whether the rules were handled; otherwise the caller asks for manual review."""
+    journal = state.get('host_firewall') or {}
+    if journal.get('report', {}).get('status') not in ('ufw-rules-processed', 'ufw-overlap-needs-review'):
+        return False
+    report = inspect(settings)
+    if report['status'] != 'can-add-ufw-rules' or file_digests() != journal.get('expected'):
+        return False
+    try:
+        overlaps = {pair: overlaps_existing(*pair) for pair in pairs}
+    except RuntimeError:
+        return False
+    tag = 'gowest-' + secrets.token_hex(6)
+    add_rules(journal, journal['report'], pairs, overlaps, tag, state, save)
+    return True
 
 
 def check_restore(state):

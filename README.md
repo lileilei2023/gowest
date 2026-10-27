@@ -3,10 +3,10 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.6.0-6366f1">
+  <img alt="version" src="https://img.shields.io/badge/version-0.7.0-6366f1">
   <img alt="platform" src="https://img.shields.io/badge/server-Ubuntu%2024.04%20amd64%20%7C%20arm64-e95420">
   <img alt="sing-box" src="https://img.shields.io/badge/sing--box-1.14.3-0ea5e9">
-  <img alt="tests" src="https://img.shields.io/badge/tests-242%20passed-22c55e">
+  <img alt="tests" src="https://img.shields.io/badge/tests-262%20passed-22c55e">
   <img alt="clients" src="https://img.shields.io/badge/clients-macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-64748b">
 </p>
 
@@ -25,24 +25,30 @@
 
 - **一条命令**：在自己电脑上运行，中文向导，几个问题就装好；失败自动回滚；升级也是一条命令。
 - **双线路互备**：Hy2 优先，故障时自动切到 VLESS，不会悄悄走直连。
-- **多人共用**：分成几份由你决定，每份一个订阅链接；忙时均分，闲时拉满。
-- **月流量配额**：填 `1TB` 或 `512GB`，订阅里显示用量，超额可自动暂停。
+- **多人共用**：每人一个订阅链接；忙时均分，闲时拉满；随时加人、删人、换链接，其他人不受影响。
+- **按人管流量**：每个链接可以单独设速度上限、月流量额度和到期日，超了只停那一个人。
+- **解锁检测**：一条命令看这台服务器能不能用 Claude、ChatGPT、TikTok、YouTube。
 
 ## 🚀 快速开始
 
-**1. 准备服务器**：空白 Ubuntu 24.04，在云控制台的安全组放行 **TCP/UDP 443** 和 **TCP 80**（多人共用时端口不同，向导会列出）。
+**1. 准备服务器**：空白 Ubuntu 24.04，在云控制台的安全组放行 **TCP/UDP 443** 和 **TCP 80**。多人共用时改为放行 **TCP/UDP 20001-20032** 和 **TCP 80**，以后加人就不用再改安全组。
 
-**2. 在你自己的电脑上运行**（会通过 SSH 把代码传到服务器并打开向导，服务器上不需要 git）：
+**2. 在你自己的电脑上运行**（通过 SSH 把代码传到服务器，服务器上不需要 git）：
 
 ```sh
 git clone https://github.com/lileilei2023/gowest.git && cd gowest
-./remote.sh root@<服务器IP>
+./remote.sh root@<服务器IP> quick 100Mbps              # 零问答，一个人用
+./remote.sh root@<服务器IP> quick 100Mbps --users 3    # 三个人共用
 ```
 
-**3. 导入客户端**：安装完成后屏幕上会显示订阅地址，也可以随时查看：
+`quick` 自动识别 IP、用默认设置直接安装，装完从你电脑上检查端口通不通，并在终端显示手机扫码导入的二维码。想逐项确认设置，就不加 `quick`，运行中文向导。
+
+**3. 导入客户端**：随时可以查看订阅地址和二维码：
 
 ```sh
-./remote.sh root@<服务器IP> urls --client mac   # 或 windows / android / shadowrocket
+./remote.sh root@<服务器IP> urls --client mac          # 或 windows / android / shadowrocket
+./remote.sh root@<服务器IP> urls --client all --qr     # 手机扫码导入
+./remote.sh root@<服务器IP> check                      # 从这台电脑检查端口和订阅是否通
 ```
 
 **以后升级**：拉取最新代码后一条命令，密钥、端口和订阅地址都不变，客户端无需重新导入：
@@ -75,21 +81,35 @@ Windows 电脑没有 `sh` 时，可以 SSH 登录服务器后在服务器上 `gi
 
 - 每个链接有独立的密钥和端口，泄露了只影响那一份；
 - 带宽按链接分配：一个人用时拉满，几个人同时用时均分，开多少连接都抢不走别人的份额；
-- 可以给某个链接单独设上限，例如 `bob:20Mbps`。
+- 每个链接可以单独设速度上限、月流量额度和到期日，超额或到期只停那一个人，其他人不受影响。
 
 下图是真实内核上的实测结果（总速率 95 Mbps）：
 
 <p align="center"><img src="docs/images/fair-share.png" alt="按订阅链接分配实测" width="100%"></p>
 
-装好之后也可以随时调整，立即生效，订阅地址不变：
+装好之后随时管理，立即生效，其他人的订阅地址不变：
 
 ```sh
-./remote.sh root@<服务器IP> bandwidth --set 200Mbps
-./remote.sh root@<服务器IP> bandwidth --user bob --cap 20Mbps
-./remote.sh root@<服务器IP> traffic --quota 1TB --on-exceed stop
+./remote.sh root@<服务器IP> users                                    # 每个人的端口、上限、本月用量、到期日、状态
+./remote.sh root@<服务器IP> users add dave --quota 100 --expire 2026-12-31
+./remote.sh root@<服务器IP> users set bob --cap 20Mbps --quota 200    # 速度上限、月流量额度
+./remote.sh root@<服务器IP> users reset bob                          # 链接泄露了：只换他一个人的
+./remote.sh root@<服务器IP> users remove bob
+./remote.sh root@<服务器IP> bandwidth --set 200Mbps                  # 整台服务器的带宽
+./remote.sh root@<服务器IP> traffic --quota 1TB --on-exceed stop     # 整台服务器的月流量
 ```
 
-只写数字时，流量按 GB、带宽按 Mbps 计算。实现原理和计量口径见 [详细说明](docs/详细说明.md)。
+- 每人的用量按他自己的上传加下载统计，订阅里显示的是他自己的用量和额度。整台服务器的用量另外统计，大约是所有人用量之和的两倍，因为服务器收发各算一次，云厂商一般按这个计费。
+- 额度和到期日用 `0` 或 `none` 取消。超额的人下个月自动恢复；调高额度后几分钟内恢复。
+- 只写数字时，流量按 GB、带宽按 Mbps 计算。实现原理见 [详细说明](docs/详细说明.md)。
+
+## 🧭 Claude / TikTok 能不能用
+
+```sh
+./remote.sh root@<服务器IP> unlock
+```
+
+在服务器上检测出口 IP 的国家和运营商，以及 Claude、ChatGPT、TikTok、YouTube 能否正常使用。所有客户端都从这个 IP 出去，所以结果对每个人都一样。建议买服务器后先测一下再装。检测依据是各网站公开的返回特征，网站调整后可能失准。
 
 ## 📥 客户端下载
 
@@ -119,7 +139,7 @@ Mac / Windows 也可以直接运行 `clients/` 里的一键脚本，自动下载
 <summary><b>常用运维命令</b></summary>
 
 ```sh
-./remote.sh root@<服务器IP> status     # 版本、运行状态、队列、本月流量
+./remote.sh root@<服务器IP> status     # 版本、运行状态、队列、本月流量、各链接用量
 ./remote.sh root@<服务器IP> verify     # 本机验收
 ./remote.sh root@<服务器IP> rollback   # 回滚（可恢复）
 ```
@@ -135,7 +155,9 @@ Mac / Windows 也可以直接运行 `clients/` 里的一键脚本，自动下载
 gowest/
 ├── remote.sh                 # 在自己电脑上运行：上传、安装、升级、管理
 ├── deploy.sh / launcher.py   # 中文向导与统一入口
-├── vpn.py                    # plan / install / upgrade / status / verify / urls / bandwidth / traffic / rollback
+├── vpn.py                    # plan / install / upgrade / status / verify / urls / users / unlock / bandwidth / traffic / rollback
+├── accounting.py             # 每个链接的流量计数、超额或到期暂停（nftables）
+├── unlock.py                 # Claude / ChatGPT / TikTok / YouTube 解锁检测
 ├── render.py                 # 密钥、端口、Clash YAML、小火箭配置
 ├── network.py                # BBR / FQ 与按链接分配的 HTB 队列
 ├── subinfo.py                # 月流量统计、超额暂停与恢复
@@ -161,7 +183,8 @@ python3 -B -m unittest discover -s tests -v
 - 只支持**全新服务器**，检测到已有代理或网站时会拒绝安装。
 - HTTP 订阅会明文传输凭据，安装时需要确认；不要把订阅地址贴到公开的地方。
 - 云安全组需要你自己放行，工具无法替你验证公网是否可达。
-- 流量统计和超额暂停作用于整台服务器，不区分链接。
+- 每个链接的用量按端口统计，服务器重启后的头一两分钟不计入。整台服务器的流量上限和暂停作用于所有人。
+- 一个人用的安装（端口 443）不能事后加人；要多人共用请在安装时就选 2 份或以上。
 - 本仓库不含任何节点的密钥或订阅。顶部动画和界面截图为示意图，IP、延迟等数值仅作演示；带宽实测图是真实数据。
 
 本项目仅供学习与研究网络技术使用，请遵守当地法律法规和服务条款。

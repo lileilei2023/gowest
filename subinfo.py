@@ -32,39 +32,91 @@ def header(rx, tx, total=0, expire=0, metering='both'):
     return 'add_header subscription-userinfo "' + '; '.join(values) + '" always;\n'
 
 
+def server_usage(s):
+    """(rx, tx, month) of the whole NIC from vnStat, or None before its DB is ready."""
+    net = json.loads((STATE / 'network.json').read_text())
+    result = subprocess.run(['vnstat', '-i', net['interface'], '--json', 'm', '1'],
+                            check=True, capture_output=True, text=True, timeout=20)
+    rows = json.loads(result.stdout)['interfaces'][0]['traffic'].get('month', [])
+    if not rows:
+        return None  # Do not publish invented zero usage when the DB isn't ready.
+    usage = rows[-1]
+    return usage['rx'], usage['tx'], '{year:04d}-{month:02d}'.format(**usage['date'])
+
+
+def user_headers(s, record, server):
+    """name -> header. A URL with its own quota shows its own usage; others
+    show the server's figures. A URL's own expiry wins over the server's."""
+    import accounting
+    result = {}
+    for name in s['users']:
+        row = record['users'][name]
+        quota = s.get('user_quota', {}).get(name, 0)
+        expire = accounting.expire_epoch(s.get('user_expire', {}).get(name, '')) or s['traffic']['expire_epoch']
+        if quota:
+            # Client view: upload = into the server's port, download = out of it.
+            values = [f"upload={row['upload']}", f"download={row['download']}", f'total={quota}']
+            if expire:
+                values.append(f'expire={expire}')
+            result[name] = 'add_header subscription-userinfo "' + '; '.join(values) + '" always;\n'
+        elif server:
+            result[name] = header(server[0], server[1], s['traffic']['total_bytes'], expire,
+                                  s['traffic'].get('metering', 'both'))
+    return result
+
+
+def publish(files):
+    """Write changed header files, validate Nginx, reload; restore all on failure."""
+    old = {path: path.read_text() if path.is_file() else None for path in files}
+    changed = {path: text for path, text in files.items() if old[path] != text}
+    if not changed:
+        return
+    for path, text in changed.items():
+        path.parent.mkdir(mode=0o755, exist_ok=True)
+        tmp = path.with_name(path.name + '.new')
+        tmp.write_text(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    test = subprocess.run(['nginx', '-t', '-c', str(ROOT / 'nginx.conf')], capture_output=True)
+    if test.returncode:
+        for path in changed:
+            if old[path] is None:
+                path.unlink()
+            else:
+                path.write_text(old[path])
+        raise RuntimeError('Nginx validation failed; statistics header restored')
+    subprocess.run(['systemctl', 'reload', 'la-vpn-subscription.service'], check=True, timeout=20)
+
+
 def main():
     with (STATE / 'subinfo.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if json.loads((STATE / 'state.json').read_text())['status'] != 'installed':
             return
         s = json.loads((ROOT / 'settings.json').read_text())
-        net = json.loads((STATE / 'network.json').read_text())
-        result = subprocess.run(['vnstat', '-i', net['interface'], '--json', 'm', '1'],
-                                check=True, capture_output=True, text=True, timeout=20)
-        rows = json.loads(result.stdout)['interfaces'][0]['traffic'].get('month', [])
-        if not rows:
-            return  # Do not publish invented zero usage when the DB isn't ready.
-        usage = rows[-1]
-        traffic = s['traffic']
-        metering = traffic.get('metering', 'both')
-        month = '{year:04d}-{month:02d}'.format(**usage['date'])
-        used = used_bytes(usage['rx'], usage['tx'], metering)
-        enforce(traffic, used, month)
-        new = header(usage['rx'], usage['tx'], traffic['total_bytes'], traffic['expire_epoch'], metering)
-        target = ROOT / 'subinfo.conf'
-        old = target.read_text()
-        if new == old:
-            return
-        tmp = ROOT / 'subinfo.conf.new'
-        tmp.write_text(new)
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, target)
-        test = subprocess.run(['nginx', '-t', '-c', str(ROOT / 'nginx.conf')], capture_output=True)
-        if test.returncode:
-            tmp.write_text(old)
-            os.replace(tmp, target)
-            raise RuntimeError('Nginx validation failed; statistics header restored')
-        subprocess.run(['systemctl', 'reload', 'la-vpn-subscription.service'], check=True, timeout=20)
+        s.setdefault('user_ports', {})
+        record = None
+        if s.get('users'):
+            import accounting
+            import render
+            ports = dict(zip(s['users'], render.proxy_ports(s)))
+            try:
+                record = accounting.sync(s, ports)
+            except (OSError, RuntimeError) as error:
+                # Without nftables only per-URL figures are lost; keep the server header.
+                print('Per-URL accounting unavailable: ' + str(error)[:200])
+        server = server_usage(s)
+        files = {}
+        if server:
+            traffic = s['traffic']
+            metering = traffic.get('metering', 'both')
+            enforce(traffic, used_bytes(server[0], server[1], metering), server[2])
+            files[ROOT / 'subinfo.conf'] = header(server[0], server[1], traffic['total_bytes'],
+                                                  traffic['expire_epoch'], metering)
+        if record:
+            for name, text in user_headers(s, record, server).items():
+                files[ROOT / 'subinfo.d' / (name + '.conf')] = text
+        publish(files)
 
 
 def enforce(traffic, used, month, systemctl=None):

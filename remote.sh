@@ -3,9 +3,11 @@
 # install, upgrade or manage it there. The server needs no git and no
 # access to this (private) repository.
 #
-#   ./remote.sh root@203.0.113.7              首次安装（运行中文向导）
-#   ./remote.sh root@203.0.113.7 upgrade      升级为本机这份代码；密钥和订阅地址不变
-#   ./remote.sh root@203.0.113.7 status       其他管理命令：status / urls / bandwidth / traffic …
+#   ./remote.sh root@203.0.113.7                    首次安装（中文向导）
+#   ./remote.sh root@203.0.113.7 quick 100Mbps      零问答安装（可加 --users 3）
+#   ./remote.sh root@203.0.113.7 check             从这台电脑测端口和订阅是否通
+#   ./remote.sh root@203.0.113.7 upgrade           升级为本机这份代码；密钥和订阅地址不变
+#   ./remote.sh root@203.0.113.7 users add dave    其他管理：status / urls / users / unlock / bandwidth / traffic …
 #
 # 目标可以是 ~/.ssh/config 里的别名；这时 upgrade 等命令需要用
 # GOWEST_IP=<服务器公网IP> 指明要确认的地址。
@@ -14,7 +16,7 @@ kit_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 remote_dir=${GOWEST_REMOTE_DIR:-gowest}
 
 if [ $# -lt 1 ] || [ "$1" = -h ] || [ "$1" = --help ]; then
-    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
 fi
 target=$1
@@ -49,12 +51,60 @@ with_ip() {
     args=$*
 }
 
+check() {
+    # Outside-in: what a client on the internet sees, which the server itself cannot tell.
+    info=$(ssh "$target" "if [ -x /opt/la-vpn/gowest ]; then sudo /opt/la-vpn/gowest endpoints; else sudo bash /opt/la-vpn/deploy.sh endpoints; fi")
+    python3 - "$info" <<'PY'
+import json, socket, sys, urllib.request
+info = json.loads(sys.argv[1])
+ip, ok = info['server_ip'], True
+def tcp(port):
+    try:
+        socket.create_connection((ip, port), timeout=5).close()
+        return True
+    except OSError:
+        return False
+for port in info['proxy_ports'] + info['subscription_ports']:
+    good = tcp(port)
+    ok &= good
+    print(f"  {'✓' if good else '✗'} TCP {port}" + ('' if good else '  不通：检查云安全组和本机防火墙'))
+try:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(info['subscription_url'], timeout=8) as r:
+        print(f"  ✓ 订阅可以下载（HTTP {r.status}）")
+except Exception as e:
+    ok = False
+    print(f"  ✗ 订阅下载失败：{type(e).__name__}")
+print('  · UDP（Hy2）无法从外部探测；请确认安全组也放行了 UDP ' + '、'.join(map(str, info['proxy_ports']))
+      + '。Hy2 不通时客户端会自动改走 VLESS。')
+sys.exit(0 if ok else 1)
+PY
+}
+
 action=$1
 case $action in
     install)
         shift
         upload
-        exec ssh -t "$target" "cd '$remote_dir' && sudo bash deploy.sh $*" ;;
+        ssh -t "$target" "cd '$remote_dir' && sudo bash deploy.sh $*"
+        echo "装好后可运行：$0 $target check   # 从这台电脑检查端口和订阅是否通"
+        exit ;;
+    quick)
+        upload
+        ssh -t "$target" "cd '$remote_dir' && sudo bash deploy.sh $*"
+        echo "→ 从这台电脑检查外网连通性"
+        check || true
+        exec ssh -t "$target" "sudo bash /opt/la-vpn/deploy.sh urls --client all --qr 2>/dev/null ||
+            { sudo bash /opt/la-vpn/deploy.sh users list; echo; echo '查看某人的订阅和二维码：$0 $target urls --user <名字> --qr'; }" ;;
+    check)
+        echo "→ 从这台电脑检查外网连通性"
+        check
+        exit ;;
+    users)
+        case ${2:-list} in
+            list) args=$* ;;
+            *) with_ip "$@" ;;
+        esac ;;
     upgrade)
         with_ip "$@"
         upload

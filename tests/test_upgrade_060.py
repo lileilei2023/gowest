@@ -75,7 +75,7 @@ class UpgradeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'changed externally'):
                     vpn.upgrade('192.0.2.10')
         self.assertFalse((vpn.PROGRAM / 'vpn.py').read_bytes().endswith(b'# newer\n'))
-        self.assertEqual(self.calls(), [[str(vpn.PROGRAM / 'bin/sing-box'), 'version']])
+        self.assertEqual([c for c in self.calls() if c[0] != 'apt-get'], [[str(vpn.PROGRAM / 'bin/sing-box'), 'version']])
 
     def test_failed_start_restores_previous_files(self):
         before = (vpn.CONFIG / 'server.json').read_bytes()
@@ -110,6 +110,7 @@ class MultiUserUpgradeTests(unittest.TestCase):
         raw = dict(self.s, users=['alice', 'bob', 'carol'])
         raw.pop('fair_share')
         self.stack.enter_context(patch.object(vpn.network, 'missing_modules', return_value=[]))
+        self.stack.enter_context(patch.object(vpn.network, 'health', return_value={'fair_share': {'result': 'skipped'}}))
         self.s = render.settings(raw)
         vpn.install(self.s, '192.0.2.10')
         self.commands.reset_mock()

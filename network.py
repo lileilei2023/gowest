@@ -249,6 +249,28 @@ def set_plan(state_path, plan):
     return state
 
 
+def replace_plan(state_path, plan):
+    """URLs were added or removed: rebuild our tree in place (a brief requeue)."""
+    state = json.loads(Path(state_path).read_text())
+    shaping = state.get('shaping') or {}
+    if shaping.get('result') != 'applied':
+        raise RuntimeError('Per-URL fair share is not active on this server')
+    if [u['port'] for u in plan['users']] == [u['port'] for u in shaping['plan']['users']]:
+        return set_plan(state_path, plan)
+    dev = state['interface']
+    if not owned_tree(dev, shaping):
+        raise RuntimeError('Managed share tree changed outside this installer; refusing change')
+    shaping.update(plan=plan, result='applying')
+    save(state_path, state)
+    run('tc', 'qdisc', 'del', 'dev', dev, 'root')
+    build_tree(dev, plan)
+    if not owned_tree(dev, shaping):
+        raise RuntimeError('Rebuilt share tree did not take effect; snapshot retained for recovery')
+    shaping['result'] = 'applied'
+    save(state_path, state)
+    return state
+
+
 def set_fq(state_path, state, before):
     actual = topology(state['interface'])
     if not actual['isolated'] or identity(actual['root']) != identity(before):

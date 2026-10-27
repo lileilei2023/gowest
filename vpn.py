@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import platform
 import pwd
+import re
 import shutil
 import signal
 import subprocess
@@ -46,7 +47,7 @@ RELEASES = {'x86_64': ('amd64', 'e2bdf179c15a3652955dc44867e33ca0965c9c9b91b3426
             'aarch64': ('arm64', '29dae24d76bea3bc62d07dd3e60cfc12003de7debbd6b768df9be9c68360174e')}
 PROGRAM_FILES = ('vpn.py', 'render.py', 'routing.py', 'network.py', 'subinfo.py', 'launcher.py',
                  'deploy.sh', 'firewall.py', 'autoconfig.py', 'hostfirewall.py',
-                 'kit_runtime.py', 'installlog.py')
+                 'kit_runtime.py', 'installlog.py', 'accounting.py', 'unlock.py')
 SERVICES = ['la-vpn.service', 'la-vpn-subscription.service', 'la-vpn-fq.service',
             'la-vpn-subinfo.service', 'la-vpn-subinfo.timer']
 
@@ -513,7 +514,8 @@ def install(cfg, confirm, firewall_mode='auto'):
             (UNITS / 'nginx.service').symlink_to('/dev/null')
             run(['systemctl', 'daemon-reload'])
             run(['apt-get', 'update'], timeout=300)
-            packages = ['ca-certificates', 'curl', 'openssl', 'iproute2', 'kmod', 'nginx', 'vnstat']
+            packages = ['ca-certificates', 'curl', 'openssl', 'iproute2', 'kmod', 'nginx', 'vnstat',
+                        'nftables', 'qrencode']
             if not kit_runtime.compiled():
                 packages.append('python3-yaml')
             run(['apt-get', 'install', '-y', '--no-install-recommends'] + packages, timeout=600)
@@ -622,6 +624,9 @@ def rollback(automatic=False):
         run(['systemctl', 'disable', '--now', name], check=False)
     if net.exists():
         network.restore(net)
+    if shutil.which('nft'):
+        import accounting
+        accounting.remove()
     hostfirewall.restore(s, save_state)
     unmask_stock(s)
     # Preserve every managed file, including keys, instead of deleting the deployment.
@@ -754,41 +759,69 @@ def sing_box_version():
     return words[2] if len(words) > 2 and words[:2] == ['sing-box', 'version'] else ''
 
 
-def upgrade(confirm):
-    """Swap in this kit's code and re-render configs from the stored keys.
+def load_keys():
+    return json.loads((STATE / 'generated/secrets.json').read_text())
 
-    Keys, ports and subscription URLs stay the same. Every file is checked
-    against its recorded digest before anything changes, and a failed start
-    puts the previous files back."""
-    s, cfg = installed(confirm)
-    keys = json.loads((STATE / 'generated/secrets.json').read_text())
-    dev = json.loads((STATE / 'network.json').read_text())['interface']
-    targets = {path: (data, 0o755, None) for path, data in program_files().items()}
-    targets.update({UNITS / name: (text.encode(), 0o644, None) for name, text in service_files(dev).items()})
-    targets[CONFIG / 'settings.json'] = (dump(cfg).encode(), 0o600, None)
-    targets[CONFIG / 'server.json'] = (dump(server_config(cfg, keys)).encode(), 0o640, 'la-vpn')
-    targets[CONFIG / 'nginx.conf'] = (nginx_config(cfg, keys).encode(), 0o600, None)
+
+def config_targets(cfg, keys):
+    """Every owned file derived from settings + keys, as path -> (bytes, mode, group)."""
+    targets = {CONFIG / 'settings.json': (dump(cfg).encode(), 0o600, None),
+               CONFIG / 'server.json': (dump(server_config(cfg, keys)).encode(), 0o640, 'la-vpn'),
+               CONFIG / 'nginx.conf': (nginx_config(cfg, keys).encode(), 0o600, None)}
     for account in accounts(cfg, keys):
         for name, body in client_files(cfg, account).items():
             targets[served_dir(account['name']) / name] = (body.encode(), 0o640, 'www-data')
-    current = sing_box_version()
-    if current and current != VERSION:
-        targets[PROGRAM / 'bin/sing-box'] = (fetch_binary(), 0o755, None)
+    return targets
+
+
+def refresh_generated(cfg, keys):
+    """Rewrite the private copies urls/verify read, and the keys they come from."""
+    generated = STATE / 'generated'
+    with tempfile.TemporaryDirectory(dir=STATE) as tmp:
+        for account in accounts(cfg, keys):
+            fresh = Path(tmp) / account_dir(account['name'])
+            write_account(fresh, cfg, account)
+            target = generated / account_dir(account['name'])
+            target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            for item in fresh.iterdir():
+                os.replace(item, target / item.name)
+    if cfg['users']:
+        for folder in (generated / 'users').iterdir():
+            if folder.name not in cfg['users']:
+                shutil.rmtree(folder)
+    tmp = generated / '.secrets.json.new'
+    tmp.write_text(dump(keys))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, generated / 'secrets.json')
+
+
+def snapshot(path):
+    st = path.stat()
+    return path.read_bytes(), st.st_mode & 0o777, st.st_gid
+
+
+def reconcile(s, targets, cfg, keys, removed=()):
+    """Bring owned files to `targets` and remove `removed`, all or nothing.
+
+    Every file is checked against its recorded digest before anything changes;
+    a validation or start failure puts every file back and restarts again.
+    Returns the restarted services, or None when nothing differed."""
     changed = {p: v for p, v in targets.items() if p.is_symlink() or not p.exists() or p.read_bytes() != v[0]}
-    for path in changed:
+    removed = [p for p in removed if p.exists() or p.is_symlink()]
+    for path in list(changed) + removed:
         recorded = s['files'].get(str(path))
         if recorded is None and (path.exists() or path.is_symlink()):
-            raise RuntimeError('File not owned by gowest; refusing upgrade: ' + str(path))
+            raise RuntimeError('File not owned by gowest; refusing change: ' + str(path))
         if recorded is not None and (path.is_symlink() or not path.exists() or sha(path) != recorded):
-            raise RuntimeError('Managed file changed externally; refusing upgrade: ' + str(path))
-    previous = s.get('kit_version', '0.5.9 或更早')
-    if not changed:
-        s['kit_version'] = KIT_VERSION
-        save_state(s)
-        print(f'已是最新：gowest {KIT_VERSION}，sing-box {current or VERSION}；没有文件需要更新。')
-        return
-    backup = {path: path.read_bytes() if path.exists() else None for path in changed}
-    names = {path.name for path in changed}
+            raise RuntimeError('Managed file changed externally; refusing change: ' + str(path))
+    if not changed and not removed:
+        return None
+    backup = {path: snapshot(path) if path.exists() else None for path in list(changed) + removed}
+    generated = STATE / 'generated'
+    saved = STATE / 'generated.previous'
+    shutil.rmtree(saved, ignore_errors=True)
+    shutil.copytree(generated, saved, symlinks=True)
+    names = {path.name for path in list(changed) + removed}
     restart = []
     if names & {'server.json', 'sing-box', 'la-vpn.service'}:
         restart.append('la-vpn.service')
@@ -800,6 +833,11 @@ def upgrade(confirm):
                 replace_managed(s, path, data, mode, group)
             else:
                 managed_file(s, path, data, mode, group)
+        for path in removed:
+            s['files'].pop(str(path))
+            save_state(s)
+            path.unlink()
+        refresh_generated(cfg, keys)
         run(['systemctl', 'daemon-reload'])
         run([str(PROGRAM / 'bin/sing-box'), 'check', '-c', str(CONFIG / 'server.json')])
         run(['nginx', '-t', '-c', str(CONFIG / 'nginx.conf')])
@@ -807,36 +845,197 @@ def upgrade(confirm):
             run(['systemctl', 'restart'] + restart, timeout=90)
         verify_started(s)
     except BaseException:
-        print('升级失败，正在恢复原来的文件……', file=sys.stderr)
-        for path, data in backup.items():
-            if data is None:
+        print('修改未通过校验，正在恢复原来的文件……', file=sys.stderr)
+        for path, old in backup.items():
+            if old is None:
                 path.unlink(missing_ok=True)
                 s['files'].pop(str(path), None)
-            else:
-                tmp = path.with_name('.' + path.name + '.restore')
-                tmp.write_bytes(data)
-                shutil.copymode(path, tmp)
-                if changed[path][2]:
-                    os.chown(tmp, 0, grp.getgrnam(changed[path][2]).gr_gid)
-                os.replace(tmp, path)
-                s['files'][str(path)] = hashlib.sha256(data).hexdigest()
+                continue
+            data, mode, gid = old
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name('.' + path.name + '.restore')
+            tmp.write_bytes(data)
+            os.chmod(tmp, mode)
+            os.chown(tmp, 0, gid)
+            os.replace(tmp, path)
+            s['files'][str(path)] = hashlib.sha256(data).hexdigest()
         save_state(s)
+        shutil.rmtree(generated)
+        saved.rename(generated)
         run(['systemctl', 'daemon-reload'], check=False)
         if restart:
             run(['systemctl', 'restart'] + restart, check=False, timeout=90)
         raise
-    # Refresh the private copies that urls reads; their content follows the new kit.
-    with tempfile.TemporaryDirectory(dir=STATE) as tmp:
-        for account in accounts(cfg, keys):
-            fresh = Path(tmp) / account_dir(account['name'])
-            write_account(fresh, cfg, account)
-            for item in fresh.iterdir():
-                os.replace(item, STATE / 'generated' / account_dir(account['name']) / item.name)
+    shutil.rmtree(saved, ignore_errors=True)
+    return restart
+
+
+def upgrade(confirm):
+    """Swap in this kit's code and re-render configs from the stored keys.
+
+    Keys, ports and subscription URLs stay the same."""
+    s, cfg = installed(confirm)
+    keys = load_keys()
+    dev = json.loads((STATE / 'network.json').read_text())['interface']
+    targets = {path: (data, 0o755, None) for path, data in program_files().items()}
+    targets.update({UNITS / name: (text.encode(), 0o644, None) for name, text in service_files(dev).items()})
+    targets.update(config_targets(cfg, keys))
+    current = sing_box_version()
+    if current and current != VERSION:
+        targets[PROGRAM / 'bin/sing-box'] = (fetch_binary(), 0o755, None)
+    previous = s.get('kit_version', '0.5.9 或更早')
+    # Tools newer versions rely on (per-URL counters, QR codes); installs made
+    # before them lack the packages. A failure only disables those features.
+    missing = [name for name, tool in (('nftables', 'nft'), ('qrencode', 'qrencode')) if not shutil.which(tool)]
+    if missing and run(['apt-get', 'install', '-y', '--no-install-recommends'] + missing,
+                       check=False, timeout=600).returncode:
+        print('未能安装 ' + '、'.join(missing) + '；分链接统计或二维码暂不可用，可稍后重试 upgrade。')
+    restart = reconcile(s, targets, cfg, keys)
     s['kit_version'] = KIT_VERSION
     save_state(s)
-    print(f'已升级：gowest {previous} → {KIT_VERSION}，更新了 {len(changed)} 个文件'
+    if restart is None:
+        print(f'已是最新：gowest {KIT_VERSION}，sing-box {current or VERSION}；没有文件需要更新。')
+        return
+    after_users_change(s, cfg)
+    print(f'已升级：gowest {previous} → {KIT_VERSION}'
           + (f'，重启了 {"、".join(restart)}' if restart else '，无需重启代理') + '。')
     print('密钥、端口和订阅地址都没有变；客户端下次更新订阅时会拿到新配置。')
+
+
+def after_users_change(s, cfg):
+    """Queue tree, counters and subscription headers follow the current URL list."""
+    if not cfg['users']:
+        return
+    plan = share_plan(cfg)
+    if plan and network.health(STATE / 'network.json')['fair_share']['result'] == 'applied':
+        network.replace_plan(STATE / 'network.json', plan)
+    run(['systemctl', 'start', 'la-vpn-subinfo.service'], check=False, timeout=60)
+
+
+def show_qr(base, client, user):
+    """Phone imports: Shadowrocket scans the node subscription itself; on
+    Android the camera opens the clashmeta:// link in CMFA."""
+    from render import install_link, profile_names
+    if not shutil.which('qrencode'):
+        print('\n显示二维码需要 qrencode：sudo apt-get install -y qrencode')
+        return
+    label = json.loads((CONFIG / 'settings.json').read_text()).get('node_prefix', 'LA')
+    codes = []
+    if client in ('all', 'shadowrocket'):
+        codes.append(('iPhone 小火箭：首页右上角扫码，导入节点订阅', base + '-nodes'))
+    if client in ('all', 'android'):
+        codes.append(('Android：用相机扫码，在 CMFA 中打开（日常分流）',
+                      install_link('clashmeta', base, profile_names(label, user)['normal'])))
+    if not codes:
+        print('\n电脑端请用上面的链接导入；二维码用于手机（--client android 或 shadowrocket）。')
+    for title, text in codes:
+        print('\n' + title + '（含私密订阅，勿截图外传）')
+        print(run(['qrencode', '-t', 'ANSIUTF8', '-m', '2'], data=text).stdout, end='')
+
+
+def user_rows(cfg):
+    usage = STATE / 'user-traffic.json'
+    record = json.loads(usage.read_text()) if usage.is_file() else {}
+    rows = []
+    for name, port in zip(cfg['users'], proxy_ports(cfg)):
+        row = record.get('users', {}).get(name, {})
+        used = row.get('upload', 0) + row.get('download', 0)
+        quota = cfg['user_quota'].get(name, 0)
+        rows.append({'name': name, 'port': port,
+                     'cap': f"{cfg['user_caps'][name]} Mbps" if name in cfg['user_caps'] else '不限',
+                     'used': format_gb(used) + (f' / {format_gb(quota)}' if quota else ''),
+                     'expire': cfg['user_expire'].get(name, '不限'),
+                     'status': {'quota': '已暂停（超额度）', 'expired': '已暂停（已到期）'}.get(row.get('paused'), '正常')})
+    return rows
+
+
+def print_users(cfg):
+    if not cfg['users']:
+        print('单人模式（端口 443），没有分链接的设置。')
+        return
+    print(f'{"名字":<12}{"端口":<8}{"速度上限":<12}{"本月用量 / 额度":<24}{"到期日":<12}状态')
+    for r in user_rows(cfg):
+        print(f"{r['name']:<14}{r['port']:<10}{r['cap']:<14}{r['used']:<28}{r['expire']:<15}{r['status']}")
+
+
+def change_users(confirm, action, name='', cap=None, quota=None, expire=None):
+    """add / remove / reset / set one subscription URL; other URLs stay unchanged."""
+    import launcher
+    from render import USER_NAME, MAX_USERS, free_port, new_credentials, parse_bytes, parse_date
+    s, cfg = installed(confirm)
+    if not cfg['users']:
+        raise RuntimeError('这台服务器是单人安装（端口 443），不能增删链接。'
+                           '需要多人共用时，请 rollback 后重新安装，并在"共用份数"填 2 或以上。')
+    keys = load_keys()
+    if not cfg['user_ports']:
+        cfg['user_ports'] = dict(zip(cfg['users'], proxy_ports(cfg)))
+    removed = []
+    if action == 'add':
+        if not re.fullmatch(USER_NAME, name or ''):
+            raise RuntimeError('名字只能用小写字母、数字和 -，以字母开头，最长 16 个字符')
+        if name in cfg['users']:
+            raise RuntimeError('已经有这个名字：' + name)
+        if len(cfg['users']) >= MAX_USERS:
+            raise RuntimeError(f'最多 {MAX_USERS} 个链接')
+        cfg['user_ports'][name] = free_port(cfg)
+        cfg['users'].append(name)
+        keys['users'].append(dict(new_credentials(), name=name))
+    elif name not in cfg['users']:
+        raise RuntimeError('没有这个订阅用户：' + (name or '（未指定）') + '；现有：' + '、'.join(cfg['users']))
+    elif action == 'remove':
+        if len(cfg['users']) == 1:
+            raise RuntimeError('至少要保留一个链接')
+        cfg['users'].remove(name)
+        for key in ('user_ports', 'user_caps', 'user_quota', 'user_expire'):
+            cfg[key].pop(name, None)
+        keys['users'] = [u for u in keys['users'] if u['name'] != name]
+        removed = [served_dir(name) / file for file in SUBSCRIPTION_FILES.values()]
+    elif action == 'reset':
+        keys['users'] = [dict(u, **new_credentials()) if u['name'] == name else u for u in keys['users']]
+    if cap is not None:
+        if cap in ('none', '0', ''):
+            cfg['user_caps'].pop(name, None)
+        else:
+            cfg['user_caps'][name] = launcher.whole_mbps(cap, '上限')
+    if quota is not None:
+        if parse_bytes(quota):
+            cfg['user_quota'][name] = parse_bytes(quota)
+        else:
+            cfg['user_quota'].pop(name, None)
+    if expire is not None:
+        if expire in ('none', '0', ''):
+            cfg['user_expire'].pop(name, None)
+        else:
+            cfg['user_expire'][name] = parse_date(expire)
+    cfg = settings(cfg)
+    if action == 'add':
+        folder = served_dir(name)
+        folder.mkdir(mode=0o750, exist_ok=True)
+        os.chmod(folder, 0o750)
+        os.chown(folder, 0, grp.getgrnam('www-data').gr_gid)
+    try:
+        reconcile(s, config_targets(cfg, keys), cfg, keys, removed)
+    except BaseException:
+        if action == 'add':
+            shutil.rmtree(served_dir(name), ignore_errors=True)
+        raise
+    if action == 'remove':
+        shutil.rmtree(served_dir(name), ignore_errors=True)
+    after_users_change(s, cfg)
+    if action == 'add':
+        port = cfg['user_ports'][name]
+        pairs = [('tcp', port), ('udp', port)]
+        if hostfirewall.add_ports(cfg, s, save_state, pairs):
+            print(f'本机防火墙已放行 TCP/UDP {port}。')
+        else:
+            print(f'请确认本机防火墙放行 TCP/UDP {port}。')
+        print(f'云安全组也要放行 TCP/UDP {port}（建议一次放行 TCP/UDP 20001-20032，以后加人就不用再改）。')
+    print_users(cfg)
+    if action in ('add', 'reset'):
+        print(f'\n{name} 的新订阅地址（只发给他本人）：')
+        print((STATE / 'generated' / account_dir(name) / 'subscription-urls.txt').read_text(), end='')
+        if action == 'reset':
+            print(f'{name} 的旧链接已失效，需要用新地址重新导入；其他人不受影响。')
 
 
 def main(argv=None):
@@ -862,6 +1061,7 @@ def main(argv=None):
                       help='clash = raw subscription links; mac/windows = Clash Verge Rev; '
                            'android = Clash Meta for Android; shadowrocket = iOS')
     item.add_argument('--user', default='', help='多人共用时指定用户名')
+    item.add_argument('--qr', action='store_true', help='在终端显示二维码，手机直接扫码导入')
     item = sub.add_parser('bandwidth', help='调整套餐带宽，或某个订阅链接的上限；多人模式即时生效')
     target = item.add_mutually_exclusive_group(required=True)
     target.add_argument('--set', help='总带宽，如 30Mbps、1Gbps')
@@ -873,6 +1073,15 @@ def main(argv=None):
     item.add_argument('--metering', choices=('both', 'outbound'))
     item.add_argument('--on-exceed', choices=('warn', 'stop'))
     item.add_argument('--confirm-server', required=True)
+    item = sub.add_parser('users', help='多人模式：查看、增加、删除、重置链接，设置速度上限、流量额度和到期日')
+    item.add_argument('action', nargs='?', default='list', choices=('list', 'add', 'remove', 'reset', 'set'))
+    item.add_argument('name', nargs='?', default='')
+    item.add_argument('--cap', help='速度上限，如 20Mbps；none 表示不限')
+    item.add_argument('--quota', help='每月流量额度，如 100（即 100GB）、1TB；0 表示不限。超出后只停这一个链接')
+    item.add_argument('--expire', help='到期日，如 2026-12-31（当天结束后停用）；none 表示不限')
+    item.add_argument('--confirm-server')
+    sub.add_parser('unlock', help='检测这台服务器的 IP 能否使用 Claude、ChatGPT、TikTok、YouTube')
+    sub.add_parser('endpoints', help=argparse.SUPPRESS)
     item = sub.add_parser('upgrade', help='用当前这份代码升级已安装的服务器；密钥和订阅地址不变')
     item.add_argument('--confirm-server', required=True)
     item = sub.add_parser('rollback')
@@ -925,6 +1134,27 @@ def main(argv=None):
             raise RuntimeError('请至少指定 --quota、--metering 或 --on-exceed')
         with exclusive_operation():
             change_traffic(args.confirm_server, args.quota, args.metering, args.on_exceed)
+    elif args.command == 'users':
+        if args.action == 'list':
+            print_users(settings(json.loads((CONFIG / 'settings.json').read_text())))
+            return
+        if not args.confirm_server:
+            raise RuntimeError('修改链接需要 --confirm-server <服务器公网IP>')
+        if args.action == 'set' and args.cap is None and args.quota is None and args.expire is None:
+            raise RuntimeError('users set 需要 --cap、--quota 或 --expire')
+        with exclusive_operation():
+            change_users(args.confirm_server, args.action, args.name, args.cap, args.quota, args.expire)
+    elif args.command == 'unlock':
+        import unlock
+        unlock.main()
+    elif args.command == 'endpoints':
+        # Machine-readable, for remote.sh's outside-in check; prints private URLs.
+        cfg = settings(json.loads((CONFIG / 'settings.json').read_text()))
+        first = account_dir(cfg['users'][0] if cfg['users'] else '')
+        url = (STATE / 'generated' / first / 'subscription-urls.txt').read_text().splitlines()[0].split(': ', 1)[1]
+        print(json.dumps({'server_ip': cfg['server_ip'], 'proxy_ports': proxy_ports(cfg),
+                          'subscription_ports': [x['port'] for x in subscription_endpoints(cfg)],
+                          'subscription_url': url}))
     elif args.command == 'upgrade':
         signal.signal(signal.SIGHUP, on_hangup)
         with exclusive_operation():
@@ -947,6 +1177,10 @@ def main(argv=None):
         usage = STATE / 'traffic.json'
         print(dump({'monthly_traffic': traffic_summary(json.loads(usage.read_text())) if usage.is_file()
                     else 'not measured yet (vnStat needs a few minutes)'}))
+        cfg = settings(json.loads((CONFIG / 'settings.json').read_text()))
+        if cfg['users']:
+            print('\n各链接（本月用量为客户端上传 + 下载）：')
+            print_users(cfg)
     elif args.command == 'urls':
         if load_state()['status'] != 'installed':
             raise RuntimeError('Deployment is not committed; subscription URLs are not ready')
@@ -986,6 +1220,8 @@ def main(argv=None):
                 print('首页导入节点订阅；配置页下载 .conf 并使用；全局路由选“配置”。')
             else:
                 raise RuntimeError('No Shadowrocket links in this deployment; do not guess URLs')
+        if args.qr:
+            show_qr(manifest.splitlines()[0].split(': ', 1)[1], args.client, user)
 
 
 if __name__ == '__main__':
