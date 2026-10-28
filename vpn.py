@@ -83,11 +83,12 @@ def log_failure(command, message):
 
 def run(args, *, data=None, timeout=60, check=True):
     # Ubuntu 24.04 needrestart may restart the systemd unit running this very
-    # installer after APT upgrades a library. List pending restarts instead:
-    # never kill the transaction or unexpectedly restart the SSH control path.
-    # This is child-process scoped, not a persistent host policy change.
+    # installer after APT upgrades a library. Some Ubuntu hooks still restart
+    # services with NEEDRESTART_MODE=l, so suspend that hook for this transaction.
+    # This is child-process scoped, not a persistent host policy change; normal
+    # restart/update maintenance remains the administrator's responsibility.
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', DEBIAN_FRONTEND='noninteractive',
-               NEEDRESTART_MODE='l')
+               NEEDRESTART_MODE='l', NEEDRESTART_SUSPEND='1')
     # New session protects from SSH hangup; terminate the whole group on a
     # timeout/interrupt so a grandchild cannot race the managed rollback.
     with subprocess.Popen(args, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,

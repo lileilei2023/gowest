@@ -1,5 +1,6 @@
 """Port hopping, TUIC / AnyTLS, obfuscation switch and the line check."""
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -262,8 +263,17 @@ class UiTests(unittest.TestCase):
         with self.assertRaises(ui.UserError):
             ui.api_options(self.SERVER, {})
 
+    def test_options_reaches_backend_through_real_launcher(self):
+        root = Path(__file__).resolve().parents[1]
+        result = subprocess.run([sys.executable, '-B', str(root / 'launcher.py'), 'options', '--help'],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for option in ('--hopping', '--protocols', '--obfs', '--confirm-server'):
+            self.assertIn(option, result.stdout)
+
     def test_install_can_skip_stability_features(self):
-        with patch.object(ui, 'Job') as job:
+        with patch.object(ui, 'Job') as job, \
+                patch.object(ui, 'inspect_server', return_value={'management': 'fresh'}):
             ui.api_install(self.SERVER, {'bandwidth': '100Mbps', 'stable': 'off'})
         upload, install = job.return_value.run.call_args.args[0]
         captured = []

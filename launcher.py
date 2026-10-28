@@ -19,7 +19,7 @@ import kit_runtime
 
 ROOT = Path(__file__).resolve().parent
 MANAGEMENT = {'plan', 'install', 'status', 'verify', 'urls', 'rollback', 'repair-fq', 'bandwidth', 'traffic',
-              'upgrade', 'users', 'unlock', 'endpoints'}
+              'upgrade', 'users', 'unlock', 'endpoints', 'options'}
 
 
 def build_settings(server_ip, up, down, mode, host='', cert='', key='', tailnet='',
@@ -256,7 +256,7 @@ def main(argv=None):
         return subinfo.main()
     parser = argparse.ArgumentParser(prog='gowest', description=render.PROJECT_NAME + '：双客户端代理部署与配置生成', epilog=(
         '无参数：交互向导；quick 100Mbps：零问答安装。管理命令：plan / install / upgrade / status / verify / urls / users / '
-        'unlock / bandwidth / traffic / rollback / repair-fq。'
+        'unlock / bandwidth / traffic / options / rollback / repair-fq。'
         'firewall generate / check 离线准备云端模板。'
         '各命令可加 --help；脚本不会自动 SSH，也不会自动提权。'))
     parser.add_argument('--version', action='version', version=render.PROJECT_NAME + ' ' + render.KIT_VERSION)

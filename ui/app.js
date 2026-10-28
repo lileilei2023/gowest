@@ -148,6 +148,7 @@ function render() {
 function dotClass(st) {
   if (!st || st.loading) return '';
   if (st.error) return 'bad';
+  if (st.legacy || st.management === 'unmanaged' || st.management === 'incomplete') return 'idle';
   if (st.installed === false) return 'idle';
   return healthy(st) ? 'good' : 'bad';
 }
@@ -178,13 +179,18 @@ function heroView() {
 
 function serverHead(server, st) {
   let pill = '<span class="chip"><span class="spin"></span>读取中</span>';
-  if (st?.error) pill = '<span class="chip bad">连接失败</span>';
+  if (st?.error) pill = '<span class="chip bad">读取失败</span>';
+  else if (st?.management === 'unmanaged') pill = '<span class="chip warn">已有服务 · 未接管</span>';
+  else if (st?.management === 'incomplete') pill = '<span class="chip warn">安装状态待检查</span>';
+  else if (st?.legacy) pill = '<span class="chip warn">已连接 · 旧版待升级</span>';
   else if (st?.installed === false) pill = '<span class="chip warn">未安装</span>';
   else if (st && !st.loading) pill = healthy(st)
     ? '<span class="chip good"><span class="pulse"></span>运行中</span>'
     : '<span class="chip bad">部分服务异常</span>';
-  const installed = st && !st.loading && !st.error && st.installed !== false;
-  const newer = installed && S.version && st.kit_version !== S.version;
+  const installed = st && !st.loading && !st.error && st.installed !== false && st.management !== 'incomplete';
+  const manageable = installed && !st.legacy;
+  const canUpgrade = installed && st.can_upgrade !== false;
+  const newer = canUpgrade && S.version && st.kit_version !== S.version;
   const busy = (k) => S.busy[server.id + k];
   const btn = (k, ic, text, primary) => `<button class="btn ${primary ? 'primary' : ''}" data-act="${k}" ${busy(k) ? 'disabled' : ''}>
     ${busy(k) ? '<span class="spin"></span>' : icon(ic)}${text}</button>`;
@@ -192,16 +198,17 @@ function serverHead(server, st) {
     <div>
       <h1>${esc(server.name)}</h1>
       <div class="chips">${pill}<span class="chip mono">${esc(server.ip)}</span>
-        ${installed ? `<span class="chip">gowest ${esc(st.kit_version)}</span><span class="chip">sing-box ${esc(st.sing_box)}</span>` : ''}
+        ${installed ? `<span class="chip">gowest ${esc(st.kit_version)}</span>${st.sing_box ? `<span class="chip">sing-box ${esc(st.sing_box)}</span>` : ''}` : ''}
         ${newer ? `<span class="chip warn">可升级到 ${esc(S.version)}</span>` : ''}</div>
     </div>
     <div class="actions">
-      ${installed ? btn('check', 'radar', '检查连通') + btn('linecheck', 'route', '线路体检') + btn('unlock', 'sparkle', '解锁检测') + btn('upgrade', 'upgrade', '升级', newer) : ''}
+      ${manageable ? btn('check', 'radar', '检查连通') + btn('linecheck', 'route', '线路体检') + btn('unlock', 'sparkle', '解锁检测') : ''}
+      ${canUpgrade ? btn('upgrade', 'upgrade', '升级', newer) : ''}
       <button class="btn icon" data-act="refresh" title="刷新">${icon('refresh')}</button>
       <div class="menu-wrap"><button class="btn icon" data-act="menu" data-menu="server" title="更多">${icon('more')}</button>
         ${S.menu === 'server' ? `<div class="menu">
           <button data-act="remove-server">${icon('x')}从列表移除</button>
-          ${installed ? `<button class="danger" data-act="rollback">${icon('trash')}卸载 gowest…</button>` : ''}</div>` : ''}
+          ${manageable ? `<button class="danger" data-act="rollback">${icon('trash')}卸载 gowest…</button>` : ''}</div>` : ''}
       </div>
     </div>
   </div>`;
@@ -215,6 +222,19 @@ function serverView(server) {
       <div style="display:flex;gap:14px;align-items:flex-start"><span class="mark fail">!</span>
       <div><b>无法读取这台服务器</b><p class="muted" style="margin:6px 0 16px">${esc(st.error)}</p>
       <button class="btn" data-act="refresh">${icon('refresh')}重试</button></div></div></div>`;
+  else if (st.management === 'unmanaged') body = `<div class="card" style="padding:26px 24px">
+      <h2>已有代理或网站，尚未由 gowest 接管</h2>
+      <p class="muted">SSH 已连通，但没有 gowest 安装记录。现有服务不能按空白服务器重新安装，也不能直接升级；需要先备份并制定迁移方案。</p>
+      <p class="muted">检测到：${(st.conflicts || []).map(esc).join('、')}</p>
+      <p>没有停止、覆盖或修改服务器上的服务。</p></div>`;
+  else if (st.management === 'incomplete') body = `<div class="card" style="padding:26px 24px">
+      <h2>需要先检查安装状态</h2><p>${esc(st.message)}</p></div>`;
+  else if (st.legacy) body = `<div class="card" style="padding:26px 24px">
+      <h2>已连接到旧版 gowest ${esc(st.kit_version)}</h2>
+      <p class="muted">这台服务器不支持网页所需的 JSON 状态接口，不是 SSH 连接失败。升级前仅显示基础服务状态，配置和订阅保持原样。</p>
+      <p>${ESSENTIAL.map((name) => `${esc(name)}：${esc(st.services?.[name] || 'unknown')}`).join('<br>')}</p>
+      <p>${st.can_upgrade ? '可以点右上角“升级”，经确认后才会上传并执行。升级可能短暂重启代理，建议先备份、安排维护时间。' : esc(st.message || '当前状态暂不能升级，请先核对安装记录。')}</p>
+      <p class="muted">订阅地址不变；升级不会自动开启端口跳跃、备用协议，也不会把单人安装转换成多人模式。</p></div>`;
   else if (st.installed === false) body = installView(server);
   else body = dashboard(server, st);
   return serverHead(server, st) + body;
@@ -495,7 +515,7 @@ const ACTIONS = {
     const r = await api('POST', `/servers/${id}/unlock`);
     S.results[id] = { ...(S.results[id] || {}), unlock: r };
   }),
-  upgrade: () => confirmModal('升级服务器', `把服务器上的 gowest 升级为这台电脑上的版本（${esc(S.version)}）。密钥、端口和订阅地址都不变；校验失败会自动恢复原来的文件。`, '开始升级', false, async () => {
+  upgrade: () => confirmModal('升级服务器', `把服务器上的 gowest 升级为这台电脑上的版本（${esc(S.version)}）。沿用密钥、端口和订阅地址；可能短暂重启代理，请先备份并安排维护时间。校验失败会尝试恢复原文件，完整旧版跨版本升级仍需实装验收。`, '开始升级', false, async () => {
     const r = await api('POST', `/servers/${S.current}/upgrade`);
     runJob(r.job, '升级 gowest', S.current);
   }),

@@ -133,8 +133,9 @@ class Logging056Tests(unittest.TestCase):
 
     def test_real_command_stdin_output_and_noninteractive_environment(self):
         result = vpn.run([sys.executable, '-c',
-                          'import os,sys; print(os.environ["NEEDRESTART_MODE"] + sys.stdin.read())'], data='test')
-        self.assertEqual(result.stdout.strip(), 'ltest')
+                          'import os,sys; print(os.environ["NEEDRESTART_MODE"] + '
+                          'os.environ["NEEDRESTART_SUSPEND"] + sys.stdin.read())'], data='test')
+        self.assertEqual(result.stdout.strip(), 'l1test')
 
     def test_private_log_flushes_preflight_and_preserves_paths(self):
         with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()):

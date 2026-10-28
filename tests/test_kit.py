@@ -176,15 +176,17 @@ class ConfigTests(unittest.TestCase):
 
 class SafetyTests(unittest.TestCase):
     def test_dependency_updates_cannot_auto_restart_installer(self):
-        with patch.dict(os.environ, {'NEEDRESTART_MODE': 'a'}), \
+        with patch.dict(os.environ, {'NEEDRESTART_MODE': 'a', 'NEEDRESTART_SUSPEND': ''}), \
              patch.object(vpn.subprocess, 'Popen') as command:
             process = command.return_value.__enter__.return_value
             process.communicate.return_value = ('', '')
             process.returncode = 0
             vpn.run(['apt-get', 'install', '-y', 'nginx'])
             self.assertEqual(command.call_args.kwargs['env']['NEEDRESTART_MODE'], 'l')
+            self.assertEqual(command.call_args.kwargs['env']['NEEDRESTART_SUSPEND'], '1')
             self.assertEqual(command.call_args.kwargs['env']['DEBIAN_FRONTEND'], 'noninteractive')
             self.assertEqual(os.environ['NEEDRESTART_MODE'], 'a')
+            self.assertEqual(os.environ['NEEDRESTART_SUSPEND'], '')
 
     def test_startup_retry(self):
         with patch.object(vpn, 'verify', side_effect=[RuntimeError('starting'), None]) as verify, \

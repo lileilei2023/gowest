@@ -9,6 +9,7 @@ other web pages and other machines cannot drive it.
     python3 gowest_ui.py            # or ./remote.sh ui
 """
 import argparse
+import errno
 import hmac
 import io
 import ipaddress
@@ -42,19 +43,115 @@ VALUE = re.compile(r'[A-Za-z0-9./:-]{1,32}')
 ANSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
 TYPES = {'.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
          '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml'}
+ASSETS = None
+UI_VERSION = None
+
+# Executed via stdin, not installed on the server. Only reads metadata and
+# runs status / is-active; never imports server code or returns credentials.
+INSPECT_SCRIPT = r'''
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+
+def inspect():
+    state_path = Path('/var/lib/la-vpn-deploy/state.json')
+    if not os.path.lexists(state_path):
+        paths = ('/etc/sing-box', '/usr/bin/sing-box', '/usr/local/bin/sing-box',
+                 '/etc/nginx', '/opt/la-vpn', '/etc/la-vpn', '/var/lib/la-vpn-deploy',
+                 '/var/lib/la-vpn', '/etc/sysctl.d/90-la-vpn.conf',
+                 '/etc/systemd/system/la-vpn.service', '/etc/systemd/system/nginx.service')
+        conflicts = [p for p in paths if os.path.lexists(Path(p))]
+        for name in ('sing-box', 'nginx', 'xray', 'v2ray', 'mihomo', 'clash', 'hysteria'):
+            if shutil.which(name):
+                conflicts.append(name)
+        return {'installed': False, 'management': 'unmanaged' if conflicts else 'fresh',
+                'conflicts': conflicts, 'can_upgrade': False}
+    if state_path.is_symlink():
+        raise ValueError('安装记录是符号链接，需要人工检查')
+    state = json.loads(state_path.read_text())
+    if not isinstance(state, dict) or not isinstance(state.get('files'), dict) or not state.get('server_ip'):
+        raise ValueError('安装记录不完整，需要人工检查')
+    result = {'installed': True, 'management': 'managed', 'status': state.get('status'),
+              'server_ip': state['server_ip'], 'kit_version': state.get('kit_version') or '未知旧版',
+              'can_upgrade': False, 'legacy': False}
+    source = Path('/opt/la-vpn/render.py')
+    if not state.get('kit_version') and source.is_file():
+        match = re.search(r"^KIT_VERSION\s*=\s*['\"]([^'\"]+)['\"]", source.read_text(), re.M)
+        if match:
+            result['kit_version'] = match.group(1)
+    binary = Path('/opt/la-vpn/gowest')
+    if binary.is_file() and os.access(binary, os.X_OK):
+        command = [str(binary)]
+    elif Path('/opt/la-vpn/deploy.sh').is_file():
+        command = ['bash', '/opt/la-vpn/deploy.sh']
+    else:
+        result.update(management='incomplete', message='安装记录存在，但管理程序缺失；请先检查备份，不要重新安装。')
+        return result
+    if state.get('status') != 'installed':
+        result.update(management='incomplete', message='安装记录不是已完成状态；需要先检查上次操作，不要直接升级或重装。')
+        return result
+    status_result = subprocess.run(command + ['status', '--json'], capture_output=True, text=True,
+                                   timeout=25, env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1', LC_ALL='C'))
+    # --json is deliberately hidden from argparse help in current releases.
+    # Only the explicit unknown-argument error identifies an old release.
+    legacy = status_result.returncode == 2 and bool(re.search(
+        r'(?:unrecognized arguments|unknown option)[^\n]*--json', status_result.stderr))
+    if status_result.returncode and not legacy:
+        raise ValueError('无法读取已安装程序的状态；请检查服务器上的 gowest')
+    if not legacy:
+        report = json.loads(status_result.stdout.strip().splitlines()[-1])
+        if not isinstance(report, dict) or not isinstance(report.get('services'), dict):
+            raise ValueError('状态格式不正确')
+        result['report'] = report
+    result.update(legacy=legacy, can_upgrade=True)
+    if result['legacy']:
+        names = ['la-vpn.service', 'la-vpn-subscription.service', 'la-vpn-subinfo.timer']
+        services = subprocess.run(['systemctl', 'is-active'] + names, capture_output=True, text=True, timeout=15)
+        values = services.stdout.splitlines()
+        result['services'] = {name: values[i] if i < len(values) else 'unknown' for i, name in enumerate(names)}
+    return result
+
+try:
+    print(json.dumps(inspect(), ensure_ascii=False))
+except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+    print(json.dumps({'inspection_error': '无法安全读取服务器安装记录或管理程序，请检查文件权限、磁盘和安装状态；未做任何改动。'}, ensure_ascii=False))
+'''
 
 
 class UserError(Exception):
     """A message meant for the person at the browser."""
 
 
+def local_read(path):
+    """Retry a transient SMB EIO, but never mistake a failed read for no data."""
+    for attempt in range(3):
+        try:
+            return path.read_bytes()
+        except FileNotFoundError:
+            raise
+        except OSError as error:
+            if error.errno == errno.EIO and attempt < 2:
+                time.sleep(0.05)
+                continue
+            raise UserError('无法读取本地文件 ' + str(path) + '；请检查磁盘或共享盘连接后重试。') from None
+
+
 # ---------- saved servers ----------
 
 def load_servers():
     try:
-        return json.loads(SERVERS.read_text())
-    except (OSError, ValueError):
+        data = json.loads(local_read(SERVERS))
+    except FileNotFoundError:
         return []
+    except ValueError:
+        raise UserError('服务器列表文件损坏，已保留原文件；请检查 ' + str(SERVERS)) from None
+    if not isinstance(data, list) or any(not isinstance(s, dict) or
+            not all(isinstance(s.get(k), str) for k in ('id', 'name', 'target', 'ip')) for s in data):
+        raise UserError('服务器列表格式不正确，已保留原文件；请检查 ' + str(SERVERS))
+    return data
 
 
 def save_servers(servers):
@@ -182,8 +279,19 @@ def upload(job, target):
 # ---------- API ----------
 
 def kit_version():
-    match = re.search(r"KIT_VERSION = '([^']+)'", (KIT / 'render.py').read_text())
+    if UI_VERSION is not None:
+        return UI_VERSION
+    match = re.search(r"KIT_VERSION = '([^']+)'", local_read(KIT / 'render.py').decode())
     return match.group(1) if match else ''
+
+
+def prepare_ui():
+    """Page requests need no shared-drive reads after startup."""
+    global ASSETS, UI_VERSION
+    assets = {name: local_read(UI / name) for name in
+              ('index.html', 'app.js', 'app.css', 'vendor/qrcode.min.js')}
+    version = kit_version()
+    ASSETS, UI_VERSION = assets, version
 
 
 def server_view(server):
@@ -209,15 +317,31 @@ def api_add_server(body):
     return server_view(server)
 
 
-def api_status(server):
-    probe = 'if sudo -n test -f /var/lib/la-vpn-deploy/state.json; then ' + installed_command(['status', '--json']) + \
-            '; else echo \'{"installed": false}\'; fi'
-    out = remote(server['target'], probe)
+def inspect_server(server):
+    out = remote(server['target'], 'sudo -n python3 -B -', data=INSPECT_SCRIPT.encode())
     try:
         data = json.loads(out.strip().splitlines()[-1])
     except (ValueError, IndexError):
-        raise UserError('服务器上的 gowest 版本较旧，不支持网页管理；请先点"升级"') from None
-    data.setdefault('installed', True)
+        raise UserError('服务器安装状态无法解析，未做任何改动。') from None
+    if not isinstance(data, dict) or data.get('management') not in ('managed', 'unmanaged', 'fresh', 'incomplete'):
+        raise UserError('无法安全读取服务器安装记录，请检查权限、磁盘和安装状态；未做任何改动。')
+    if data.get('installed') and data.get('server_ip') != server['ip']:
+        data.update(can_upgrade=False, message='保存的公网 IP 与安装记录不一致，请核对服务器地址后再升级。')
+    return data
+
+
+def api_status(server):
+    info = inspect_server(server)
+    if info['management'] != 'managed' or info.get('legacy'):
+        return info
+    data = info.get('report')
+    if data is None:
+        data = remote_json(server['target'], ['status', '--json'])
+    if not isinstance(data, dict) or not isinstance(data.get('services'), dict):
+        raise UserError('服务器状态格式不正确，请检查已安装程序；未做任何改动。')
+    data.update(installed=True, management='managed', legacy=False, can_upgrade=info['can_upgrade'])
+    if info.get('message'):
+        data['message'] = info['message']
     return data
 
 
@@ -310,6 +434,8 @@ def api_install(server, body):
         args += ['--no-port-hopping', '--protocols', 'none']
     if clean(body, 'prefix', re.compile(r'[A-Za-z][A-Za-z0-9-]{0,24}')):
         args += ['--node-prefix', clean(body, 'prefix')]
+    if inspect_server(server)['management'] != 'fresh':
+        raise UserError('服务器已有安装记录或代理/网站，不能重新安装；请先检查或制定迁移方案。')
     command = f'cd {REMOTE_DIR} && sudo -n bash deploy.sh ' + ' '.join(shlex.quote(a) for a in args)
     target = server['target']
     return Job('安装 gowest').run([lambda job: upload(job, target),
@@ -317,6 +443,8 @@ def api_install(server, body):
 
 
 def api_upgrade(server):
+    if not inspect_server(server).get('can_upgrade'):
+        raise UserError('当前安装状态不允许升级，请刷新状态并检查提示；没有上传或修改服务器文件。')
     command = f'cd {REMOTE_DIR} && sudo -n bash deploy.sh upgrade --confirm-server ' + shlex.quote(server['ip'])
     target = server['target']
     return Job('升级 gowest').run([lambda job: upload(job, target),
@@ -383,6 +511,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send(500, {'error': type(error).__name__ + ': ' + str(error)})
 
     def static(self, parts):
+        if ASSETS is not None:
+            name = '/'.join(parts)
+            if name not in ASSETS:
+                return self.send(404, {'error': 'not found'})
+            return self.send(200, ASSETS[name], TYPES.get(Path(name).suffix, 'application/octet-stream'))
         path = (UI / '/'.join(parts)).resolve()
         if UI.resolve() not in path.parents or not path.is_file():
             return self.send(404, {'error': 'not found'})
@@ -505,6 +638,7 @@ def main(argv=None):
     parser.add_argument('--demo', action='store_true', help='用示例数据演示页面，不连接任何服务器')
     args = parser.parse_args(argv)
     DEMO = args.demo
+    prepare_ui()
     Handler.token = secrets.token_urlsafe(24)
     httpd = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
     Handler.port = httpd.server_address[1]
